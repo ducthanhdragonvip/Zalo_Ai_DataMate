@@ -8,3 +8,4 @@ venv/
 output/
 data/
 tmp/
+llm_out/

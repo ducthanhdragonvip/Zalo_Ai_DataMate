@@ -261,6 +261,23 @@ class LlmTests(unittest.TestCase):
         self.assertIn('"email"', prompt)
         self.assertNotIn("alice@example.org", prompt)
 
+    def test_description_sends_header_and_one_masked_data_row_only(self):
+        inventory = {"files": [{"name": "sales.csv", "format": ".csv", "tables": [{"name": "sales", "preview": [
+            ["id", "customer"], ["001", "FIRST_PRIVATE"], ["002", "SECOND_PRIVATE"], ["003", "THIRD_PRIVATE"]
+        ]}]}]}
+        response = {"tables": [{"source_file": "sales.csv", "source_table": "sales"}]}
+        with patch("business_import.llm._json_call", return_value=response) as call:
+            describe_business(object(), inventory)
+        prompt = call.call_args.args[1]
+        self.assertIn('"id"', prompt)
+        self.assertIn('"customer"', prompt)
+        self.assertIn('"row": 2', prompt)
+        self.assertNotIn("FIRST_PRIVATE", prompt)
+        self.assertNotIn("SECOND_PRIVATE", prompt)
+        self.assertNotIn("THIRD_PRIVATE", prompt)
+        self.assertNotIn('"row": 3', prompt)
+        self.assertNotIn('"row": 4', prompt)
+
     def test_description_masks_row_values_and_validates_coverage(self):
         inventory = {"files": [{"name": "sales.csv", "tables": [{"name": "sales", "preview": [["id", "customer"], ["001", "private"]]}]}]}
         response = {"tables": [{"source_file": "sales.csv", "source_table": "sales"}]}
@@ -274,6 +291,20 @@ class LlmTests(unittest.TestCase):
         with patch("business_import.llm._json_call", return_value=response):
             result = generate_load_sql(object(), {"summary": "x"}, [{"name": "_stage_0", "columns": ["id"]}], "biz_1")
         self.assertEqual(result, response)
+
+    def test_each_model_call_saves_raw_output_to_llm_out(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from types import SimpleNamespace
+        from business_import.llm import _json_call
+        response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))])
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response)))
+        with TemporaryDirectory() as temp, patch("business_import.llm.OUTPUT_DIR", Path(temp)):
+            result = _json_call(client, "test prompt")
+            saved = list(Path(temp).glob("*.txt"))
+            self.assertEqual(result, {"ok": True})
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0].read_text(encoding="utf-8"), '{"ok": true}')
 
 
 class DatabaseTests(unittest.TestCase):
