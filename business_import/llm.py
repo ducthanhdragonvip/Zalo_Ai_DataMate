@@ -89,7 +89,6 @@ def describe_business(client, inventory):
                         cells = ["<blank>" if v in (None, "") else "<text>" if isinstance(v, str) else f"<{type(v).__name__}>" for v in row]
                     safe_rows.append({"row": i + 1, "kind": kind, "cells": cells})
                 table["preview"] = safe_rows
-                table["candidate_header_rows"] = sorted(i + 1 for i in candidates)
             safe_file["tables"].append(table)
         safe_inventory["files"].append(safe_file)
 

@@ -307,6 +307,7 @@ class LlmTests(unittest.TestCase):
         self.assertNotIn("debug", payload["files"][0])
         table = payload["files"][0]["tables"][0]
         self.assertNotIn("internal_metadata", table)
+        self.assertNotIn("candidate_header_rows", table)
         self.assertEqual(len(table["preview"]), 3)
         self.assertEqual(table["preview"][0]["cells"], ["id", "customer"])
         self.assertEqual([row["row"] for row in table["preview"]], [1, 2, 3])
