@@ -77,6 +77,13 @@ def describe_business(client, inventory):
                         safe_rows.append({"row": i + 1, "kind": "unclassified", "cells": ["<blank>" if v in (None, "") else "<text>" if isinstance(v, str) else f"<{type(v).__name__}>" for v in row]})
                     elif i < min(candidates, default=0):
                         safe_rows.append({"row": i + 1, "kind": "preamble", "cells": ["<blank>" if v in (None, "") else "<text>" if isinstance(v, str) else f"<{type(v).__name__}>" for v in row]})
+                if len(safe_rows) < 3:
+                    included = {item["row"] for item in safe_rows}
+                    for i, row in enumerate(preview):
+                        if i + 1 not in included:
+                            safe_rows.append({"row": i + 1, "kind": "masked_sample", "cells": ["<blank>" if v in (None, "") else "<text>" if isinstance(v, str) else f"<{type(v).__name__}>" for v in row]})
+                            if len(safe_rows) == 3:
+                                break
                 table["preview"] = safe_rows
                 table["candidate_header_rows"] = sorted(i + 1 for i in candidates)
             safe_file["tables"].append(table)
