@@ -228,6 +228,13 @@ class SqlTests(unittest.TestCase):
         plan = {"tables": [{"source": "_stage_0", "destination": "sales", "columns": ["Mã", "Amount"], "sql": 'CREATE TABLE "biz_1"."sales" AS SELECT "Mã", "Amount" FROM "_stage_0"'}]}
         self.assertEqual(validate_load_plan(plan, staging, "biz_1"), build_load_plan(staging, "biz_1"))
 
+    def test_load_plan_repairs_model_using_qualified_destination_as_staging_source(self):
+        staging = [{"name": "_stage_0", "columns": ["id"], "destination": "ban_hang"}]
+        plan = {"tables": [{"source": "biz_101.ban_hang", "destination": "biz_101.ban_hang", "columns": ["id"],
+            "sql": 'CREATE TABLE "biz_101"."ban_hang" AS SELECT "id" FROM "biz_101"."ban_hang"'}]}
+        result = validate_load_plan(plan, staging, "biz_101")
+        self.assertEqual(result, build_load_plan(staging, "biz_101"))
+
     def test_load_plan_rejects_redirected_destination(self):
         staging = [{"name": "_stage_0", "columns": ["id"], "destination": "sales"}]
         plan = {"tables": [{"source": "_stage_0", "destination": "payroll", "columns": ["id"], "sql": 'CREATE TABLE "biz_1"."payroll" AS SELECT "id" FROM "_stage_0"'}]}
