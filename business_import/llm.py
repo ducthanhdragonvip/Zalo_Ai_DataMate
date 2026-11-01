@@ -67,23 +67,27 @@ def describe_business(client, inventory):
                     first = preview[0] if preview else []
                     looks_header = _looks_like_csv_header(first) and all("@" not in str(value) for value in first)
                     candidates = {0} if len(preview) > 1 and looks_header else set()
+                candidate = min(candidates) if candidates else None
+                selected = set()
+                if candidate is not None:
+                    selected.add(candidate)
+                    if candidate > 0:
+                        selected.add(candidate - 1)
+                    if candidate + 1 < len(preview):
+                        selected.add(candidate + 1)
+                for i in range(len(preview)):
+                    if len(selected) >= 3:
+                        break
+                    selected.add(i)
                 safe_rows = []
-                for i, row in enumerate(preview):
-                    if i in candidates:
-                        safe_rows.append({"row": i + 1, "kind": "candidate_header", "cells": row})
-                        following = preview[i + 1] if i + 1 < len(preview) else []
-                        safe_rows.append({"row": i + 2, "kind": "first_data_row", "cells": ["<blank>" if v in (None, "") else "<text>" if isinstance(v, str) else f"<{type(v).__name__}>" for v in following]})
-                    elif not candidates and i == 0:
-                        safe_rows.append({"row": i + 1, "kind": "unclassified", "cells": ["<blank>" if v in (None, "") else "<text>" if isinstance(v, str) else f"<{type(v).__name__}>" for v in row]})
-                    elif i < min(candidates, default=0):
-                        safe_rows.append({"row": i + 1, "kind": "preamble", "cells": ["<blank>" if v in (None, "") else "<text>" if isinstance(v, str) else f"<{type(v).__name__}>" for v in row]})
-                if len(safe_rows) < 3:
-                    included = {item["row"] for item in safe_rows}
-                    for i, row in enumerate(preview):
-                        if i + 1 not in included:
-                            safe_rows.append({"row": i + 1, "kind": "masked_sample", "cells": ["<blank>" if v in (None, "") else "<text>" if isinstance(v, str) else f"<{type(v).__name__}>" for v in row]})
-                            if len(safe_rows) == 3:
-                                break
+                for i in sorted(selected):
+                    row = preview[i]
+                    if i == candidate:
+                        kind, cells = "candidate_header", row
+                    else:
+                        kind = "preamble" if candidate is not None and i < candidate else "first_data_row" if candidate is not None and i == candidate + 1 else "unclassified" if candidate is None and i == 0 else "masked_sample"
+                        cells = ["<blank>" if v in (None, "") else "<text>" if isinstance(v, str) else f"<{type(v).__name__}>" for v in row]
+                    safe_rows.append({"row": i + 1, "kind": kind, "cells": cells})
                 table["preview"] = safe_rows
                 table["candidate_header_rows"] = sorted(i + 1 for i in candidates)
             safe_file["tables"].append(table)

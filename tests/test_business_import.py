@@ -313,6 +313,26 @@ class LlmTests(unittest.TestCase):
         self.assertEqual(table["preview"][2]["kind"], "masked_sample")
         self.assertNotIn("private-", prompt)
 
+    def test_repeated_excel_data_rows_are_not_sent_as_candidate_headers(self):
+        headers = ["Order ID", "Customer", "Quantity"]
+        rows = [headers] + [[f"ORD{i:06}", f"Customer {i}", i if i % 2 else f"{i} packs"]
+                            for i in range(1, 40)]
+        inventory = {"files": [{"name": "orders.xlsx", "format": ".xlsx", "tables": [
+            {"name": "Sheet1", "preview": rows, "row_count": 40, "max_row": 40, "max_column": 3}
+        ]}]}
+        response = {"tables": [{"source_file": "orders.xlsx", "source_table": "Sheet1"}]}
+        with patch("business_import.llm._json_call", return_value=response) as call:
+            describe_business(object(), inventory)
+        prompt = call.call_args.args[1]
+        payload = json.loads(prompt.split("Input inventory JSON follows:\n", 1)[1])
+        preview = payload["files"][0]["tables"][0]["preview"]
+        self.assertLessEqual(len(preview), 3)
+        self.assertEqual(preview[0]["kind"], "candidate_header")
+        self.assertEqual(preview[0]["cells"], headers)
+        self.assertNotIn("ORD000001", prompt)
+        self.assertNotIn("Customer 1", prompt)
+        self.assertEqual(sum(row["kind"] == "candidate_header" for row in preview), 1)
+
     def test_description_sends_header_and_one_masked_data_row_only(self):
         inventory = {"files": [{"name": "sales.csv", "format": ".csv", "tables": [{"name": "sales", "preview": [
             ["id", "customer"], ["001", "FIRST_PRIVATE"], ["002", "SECOND_PRIVATE"], ["003", "THIRD_PRIVATE"]
