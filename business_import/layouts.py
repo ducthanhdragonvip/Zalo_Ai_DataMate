@@ -25,9 +25,7 @@ def validate_layout(rows, proposal):
         if label != header[pos - 1]:
             raise ValueError(f"header label mismatch at column {pos}")
         headers.append(label if label not in (None, "") else f"column_{pos}")
-    preamble_rows = proposal.get("preamble_rows", list(range(1, header_row)))
-    if preamble_rows != list(range(1, header_row)):
-        raise ValueError("preamble rows must account for every row before header")
+    preamble_rows = list(range(1, header_row))
     return {"header_row": header_row, "data_start_row": data_start_row, "headers": headers,
             "positions": positions, "preamble": rows[:header_row - 1],
             "records": [[row[p - 1] if p <= len(row) else None for p in positions] for row in rows[data_start_row - 1:]]}

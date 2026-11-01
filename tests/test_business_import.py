@@ -105,6 +105,15 @@ class SourceTests(unittest.TestCase):
         layout = validate_layout(inventory["files"][0]["tables"][0]["preview"], description["tables"][0])
         self.assertEqual(layout["headers"], ["id", "column_2", "amount"])
 
+    def test_layout_derives_preamble_instead_of_trusting_model_list(self):
+        rows = [["report title"], ["period: all"], [], ["date", "amount"], ["2024-01-01", "5"]]
+        proposal = {"header_row": 4, "data_start_row": 5,
+                    "columns": [{"position": i, "label": value} for i, value in enumerate(rows[3], 1)],
+                    "preamble_rows": [1]}
+        result = validate_layout(rows, proposal)
+        self.assertEqual(result["preamble"], rows[:3])
+        self.assertEqual(result["records"], [rows[4]])
+
     def test_layout_reports_header_preamble_and_context_fixture(self):
         rows = [["SỔ CHI TIẾT BÁN HÀNG"], ["Kỳ báo cáo: toàn bộ", "Kênh bán: Tất cả"], [],
                 ["Ngày", "Mã đơn hàng", "Tên hàng hóa", "Đơn vị tính", "Số lượng", "Đơn giá", "Thành tiền", "Trạng thái", "Số lượng quy đổi"], ["d", "1", "x", "cái", "1", "2", "2", "ok", "1"]]
