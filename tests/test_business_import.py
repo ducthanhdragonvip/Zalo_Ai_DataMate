@@ -145,6 +145,20 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(columns, ["Mã", "Mã__2", "Ghi chú"])
             self.assertEqual(rows, [["001", "002", "có; ghi chú"], ["003", "", "NULL"]])
 
+    def test_xlsx_inspection_handles_missing_sheet_dimensions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "report.xlsx"
+            path.touch()
+            from types import SimpleNamespace
+            sheet = SimpleNamespace(title="unknown_dimensions", max_row=None, max_column=2,
+                                    iter_rows=lambda values_only: iter([("id", "value"), ("001", "x")]))
+            with patch("business_import.sources.load_workbook") as load_workbook:
+                workbook = load_workbook.return_value
+                workbook.worksheets = [sheet]
+                inventory = inspect_business(Path(temp))
+            self.assertEqual(inventory["files"][0]["tables"][0]["row_count"], 2)
+            self.assertFalse(inventory["files"][0]["tables"][0]["is_empty"])
+
     def test_xlsx_reads_all_sheets_and_keeps_native_values_and_formula_text(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "report.xlsx"

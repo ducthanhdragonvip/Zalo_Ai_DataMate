@@ -103,13 +103,15 @@ def inspect_business(path: Path) -> dict:
                 for sheet in book.worksheets:
                     preview = []
                     populated = False
+                    row_count = 0
                     for row in sheet.iter_rows(values_only=True):
+                        row_count += 1
                         values = [_value(v) for v in row]
-                        populated = populated or any(v is not None for v in values)
+                        populated = populated or any(v is not None for v in row)
                         if len(preview) < 256:
                             preview.append(values)
                     info["tables"].append({"name": sheet.title, "max_row": sheet.max_row, "max_column": sheet.max_column,
-                        "row_count": max(0, sheet.max_row), "is_empty": not populated, "merged_ranges": [],
+                        "row_count": row_count, "is_empty": not populated, "merged_ranges": [],
                         "formula_cells": None, "preview": preview})
             finally:
                 book.close()
