@@ -7,3 +7,4 @@ venv/
 .superpowers/
 output/
 data/
+tmp/
