@@ -291,6 +291,26 @@ class LlmTests(unittest.TestCase):
         self.assertIn('"email"', prompt)
         self.assertNotIn("alice@example.org", prompt)
 
+    def test_first_call_sends_compact_inventory_and_candidate_rows_only(self):
+        preview = [["id", "customer"], *[[str(i), f"private-{i}"] for i in range(1, 40)]]
+        inventory = {"id": "biz_1", "path": Path("/ignored"), "readme": "business notes",
+                     "files": [{"name": "sales.csv", "format": ".csv", "delimiter": ",", "debug": "omit",
+                                "tables": [{"name": "sales", "row_count": 39, "max_column": 2,
+                                            "preview": preview, "internal_metadata": "omit"}]}]}
+        response = {"tables": [{"source_file": "sales.csv", "source_table": "sales"}]}
+        with patch("business_import.llm._json_call", return_value=response) as call:
+            describe_business(object(), inventory)
+        prompt = call.call_args.args[1]
+        payload = json.loads(prompt.split("Input inventory JSON follows:\n", 1)[1])
+        self.assertEqual(payload["readme"], "business notes")
+        self.assertNotIn("path", payload)
+        self.assertNotIn("debug", payload["files"][0])
+        table = payload["files"][0]["tables"][0]
+        self.assertNotIn("internal_metadata", table)
+        self.assertEqual(len(table["preview"]), 2)
+        self.assertEqual(table["preview"][0]["cells"], ["id", "customer"])
+        self.assertNotIn("private-", prompt)
+
     def test_description_sends_header_and_one_masked_data_row_only(self):
         inventory = {"files": [{"name": "sales.csv", "format": ".csv", "tables": [{"name": "sales", "preview": [
             ["id", "customer"], ["001", "FIRST_PRIVATE"], ["002", "SECOND_PRIVATE"], ["003", "THIRD_PRIVATE"]
