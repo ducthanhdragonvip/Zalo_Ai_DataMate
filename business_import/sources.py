@@ -60,15 +60,17 @@ def _sqlite_tables(path):
             selected = ", ".join('"' + c["name"].replace('"', '""') + '"' for c in columns)
             rows = db.execute(f'SELECT {selected} FROM "{escaped}"')
             observed = [set() for _ in columns]
-            count = 0
+            count, preview = 0, []
             for row in rows:
                 count += 1
+                if len(preview) < 3:
+                    preview.append([_value(value) for value in row])
                 for i, value in enumerate(row):
                     if value is not None:
                         observed[i].add(type(value).__name__)
             for i, col in enumerate(columns):
                 col["observed_types"] = sorted(observed[i])
-            output.append({"name": name, "columns": columns, "row_count": count})
+            output.append({"name": name, "columns": columns, "row_count": count, "preview": preview})
         return output
     finally:
         db.close()
@@ -112,7 +114,7 @@ def inspect_business(path: Path) -> dict:
                             preview.append(values)
                     info["tables"].append({"name": sheet.title, "max_row": sheet.max_row, "max_column": sheet.max_column,
                         "row_count": row_count, "is_empty": not populated, "merged_ranges": [],
-                        "formula_cells": None, "preview": preview})
+                        "formula_cells": None, "excel_epoch": book.epoch.date().isoformat(), "preview": preview})
             finally:
                 book.close()
         else:

@@ -1,9 +1,15 @@
+import csv
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing, redirect_stdout, redirect_stderr
+from copy import deepcopy
 from datetime import date
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import duckdb
@@ -11,10 +17,405 @@ from openpyxl import Workbook
 
 from business_import.database import load_business
 from business_import.layouts import validate_layout
-from business_import.llm import describe_business, generate_load_sql
+from business_import.llm import describe_business
+from business_import.__main__ import main, _read_tables
 from business_import.sources import discover_businesses, inspect_business, read_csv_rows, read_sqlite_rows
 from business_import.sql import build_load_plan, validate_load_plan
-from business_import.__main__ import _read_tables
+
+
+def model_client(result, prompts):
+    def create(**kwargs):
+        prompts.append(kwargs["messages"][0]["content"])
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(result)))])
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+
+def compact_description(file="sales.csv", table="sales", header=1):
+    return {"summary": "Sales business", "tables": [{"source_file": file, "source_table": table,
+            "header_row": header, "description": "One row per item"}]}
+
+
+class CompactIngestionTests(unittest.TestCase):
+    def inventory(self):
+        return {"readme": "Business notes: 1 box = 12 units.", "files": [{"name": "sales.csv", "format": ".csv",
+                "tables": [{"name": "sales", "preview": [["id", "amount"], ["001", "10"], ["002", "20"], ["003", "30"]]}]}]}
+
+    def describe(self, inventory, response):
+        prompts = []
+        with tempfile.TemporaryDirectory() as temp, patch("business_import.llm.OUTPUT_DIR", Path(temp)):
+            result = describe_business(model_client(response, prompts), inventory)
+        return result, prompts[0]
+
+    def test_compact_response_expands_exact_layout_and_sends_real_rows(self):
+        inventory = self.inventory()
+        before = deepcopy(inventory)
+        output = StringIO()
+        with redirect_stdout(output):
+            result, prompt = self.describe(inventory, compact_description())
+        payload = json.loads(prompt.split("Input inventory JSON follows:\n", 1)[1])
+        self.assertEqual(payload["readme"], inventory["readme"])
+        self.assertEqual(payload["files"][0]["tables"][0]["preview"],
+                         [[1, ["id", "amount"]], [2, ["001", "10"]], [3, ["002", "20"]]])
+        table = result["tables"][0]
+        self.assertEqual(table["columns"], [{"position": 1, "label": "id"}, {"position": 2, "label": "amount"}])
+        self.assertEqual(table["data_start_row"], 2)
+        self.assertEqual(table["preamble_rows"], [])
+        self.assertEqual(result["rules"], [])
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(inventory, before)
+
+    def test_fenced_json_and_structured_readme_rules_are_preserved(self):
+        response = compact_description()
+        response["rules"] = [{"fact": "README: unit conversion", "description": "1 box = 12 units"}]
+        content = "```json\n" + json.dumps(response) + "\n```"
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+            create=lambda **kwargs: SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=content))]))))
+        with tempfile.TemporaryDirectory() as temp, patch("business_import.llm.OUTPUT_DIR", Path(temp)):
+            result = describe_business(client, self.inventory())
+            self.assertEqual(next(Path(temp).glob("*.txt")).read_text(encoding="utf-8"), content)
+        self.assertEqual(result["rules"], ["README: unit conversion: 1 box = 12 units"])
+        self.assertEqual(result["tables"][0]["columns"][0], {"position": 1, "label": "id"})
+
+    def test_model_request_enables_json_output_mode(self):
+        from business_import.llm import _json_call
+        from unittest.mock import Mock
+        create = Mock(return_value=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{}'))]))
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        with tempfile.TemporaryDirectory() as temp, patch("business_import.llm.OUTPUT_DIR", Path(temp)):
+            self.assertEqual(_json_call(client, "prompt"), {})
+        self.assertFalse(create.call_args.kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"])
+        response_format = create.call_args.kwargs["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertTrue(response_format["json_schema"]["strict"])
+        schema = response_format["json_schema"]["schema"]
+        self.assertEqual(schema["required"], ["tables"])
+        self.assertFalse(schema["additionalProperties"])
+        table = schema["properties"]["tables"]["items"]
+        self.assertEqual(table["type"], "object")
+        self.assertEqual(set(table["required"]), {"source_file", "source_table", "header_row", "column_types"})
+        self.assertFalse(table["additionalProperties"])
+        hints = table["properties"]["column_types"]["items"]["anyOf"]
+        self.assertEqual(hints[0]["enum"], ["VARCHAR", "BIGINT", "DECIMAL", "BOOLEAN"])
+        self.assertTrue(all(not hint["additionalProperties"] for hint in hints[1:]))
+        self.assertTrue(any(hint.get("properties", {}).get("format", {}).get("enum") == ["VND"]
+                            and hint["properties"]["type"]["enum"] == ["DECIMAL"] for hint in hints))
+
+    def test_json_parser_rejects_incomplete_or_surrounding_prose(self):
+        from business_import.llm import _json_call
+        for content in ('```json\n{"summary":', 'Explanation\n{"ok": true}', '```json\n{}\n```\nextra'):
+            client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+                create=lambda **kwargs: SimpleNamespace(choices=[SimpleNamespace(
+                    message=SimpleNamespace(content=content))]))))
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as temp, patch("business_import.llm.OUTPUT_DIR", Path(temp)):
+                with self.assertRaisesRegex(ValueError, "malformed|truncated"):
+                    _json_call(client, "prompt")
+
+    def test_monthly_tables_have_explicit_exact_output_template(self):
+        inventory = self.inventory()
+        first = inventory["files"][0]
+        first["name"] = "BanHang_T1_2025.xlsx"
+        first["format"] = ".xlsx"
+        first["tables"][0]["name"] = "DonHang_ChiTiet"
+        second = deepcopy(first)
+        second["name"] = "BanHang_T2_2025.xlsx"
+        inventory["files"].append(second)
+        response = compact_description(first["name"], "DonHang_ChiTiet")
+        response["tables"].append(compact_description(second["name"], "DonHang_ChiTiet")["tables"][0])
+        result, prompt = self.describe(inventory, response)
+        instructions = prompt.split("Input inventory JSON follows:\n", 1)[0]
+        template = json.loads(instructions.split("Output template JSON follows:\n", 1)[1])
+        self.assertEqual([(t["source_file"], t["source_table"]) for t in template["tables"]],
+                         [("BanHang_T1_2025.xlsx", "DonHang_ChiTiet"), ("BanHang_T2_2025.xlsx", "DonHang_ChiTiet")])
+        self.assertEqual(len(result["tables"]), 2)
+        with tempfile.TemporaryDirectory() as temp, patch("business_import.llm.OUTPUT_DIR", Path(temp)):
+            from unittest.mock import Mock
+            create = Mock(return_value=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(response)))]))
+            client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+            describe_business(client, inventory)
+            array = create.call_args.kwargs["response_format"]["json_schema"]["schema"]["properties"]["tables"]
+            self.assertEqual((array["minItems"], array["maxItems"]), (2, 2))
+            branches = array["items"]["anyOf"]
+            self.assertEqual(branches[0]["properties"]["source_file"]["enum"], [first["name"]])
+            self.assertEqual(branches[0]["properties"]["header_row"]["enum"], [1])
+            types = branches[0]["properties"]["column_types"]
+            self.assertEqual((types["minItems"], types["maxItems"]), (2, 2))
+            self.assertEqual(branches[2]["properties"]["source_file"]["enum"], [second["name"]])
+            self.assertEqual(branches[1]["properties"]["header_row"]["enum"], [None])
+            self.assertEqual(branches[1]["properties"]["column_types"]["maxItems"], 0)
+        missing = compact_description(first["name"], "DonHang_ChiTiet")
+        with self.assertRaisesRegex(ValueError, "missing.*BanHang_T2_2025"):
+            self.describe(inventory, missing)
+        wildcard = compact_description("BanHang_T*.xlsx", "DonHang_ChiTiet")
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            self.describe(inventory, wildcard)
+
+    def test_minimal_response_loads_string_and_object_types(self):
+        response = {"tables": [{"source_file": "sales.csv", "source_table": "sales", "header_row": 1,
+                                "column_types": ["VARCHAR", {"type": "DECIMAL", "thousands_separator": ","}]}]}
+        description, prompt = self.describe(self.inventory(), response)
+        template = json.loads(prompt.split("Output template JSON follows:\n", 1)[1].split("\nInput inventory JSON follows:", 1)[0])
+        self.assertEqual(set(template), {"tables"})
+        self.assertEqual(set(template["tables"][0]), {"source_file", "source_table", "header_row", "column_types"})
+        conn = duckdb.connect(":memory:")
+        try:
+            raw = [{"source_file": "sales.csv", "source_table": "sales", "format": ".csv",
+                    "columns": ["id", "amount"], "rows": [["001", "35,000"]]}]
+            plan = build_load_plan([{"name": "_stage_0", "columns": ["id", "amount"], "destination": "sales"}], "biz_1")
+            load_business(conn, {"id": "biz_1", "split": "test"}, description, raw, {}, plan)
+            self.assertEqual(conn.execute("SELECT id, CAST(amount AS BIGINT) FROM biz_1.sales").fetchall(), [("001", 35000)])
+            self.assertEqual(description["tables"][0]["actual_types"], ["VARCHAR", "DECIMAL(38,10)"])
+        finally:
+            conn.close()
+
+    def test_type_template_has_exact_source_widths(self):
+        inventory = self.inventory()
+        inventory["files"].append({"name": "ledger.xlsx", "format": ".xlsx", "tables": [
+            {"name": "Sheet1", "preview": [["Report"], [], ["id", "qty", "price"], ["A", 2, 10]]}]})
+        inventory["files"].append({"name": "native.sqlite", "format": ".sqlite", "tables": [
+            {"name": "items", "row_count": 1, "columns": [{"name": "id"}], "preview": [[1]]}]})
+        response = compact_description()
+        response["tables"].extend([compact_description("ledger.xlsx", "Sheet1", 3)["tables"][0],
+                                   compact_description("native.sqlite", "items", None)["tables"][0]])
+        _, prompt = self.describe(inventory, response)
+        template = json.loads(prompt.split("Output template JSON follows:\n", 1)[1].split("\nInput inventory JSON follows:", 1)[0])
+        self.assertEqual([t["column_types"] for t in template["tables"]],
+                         [["VARCHAR"] * 2, ["VARCHAR"] * 3, ["VARCHAR"]])
+
+    def test_missing_excel_dimensions_uses_preview_width_without_header_candidate(self):
+        inventory = {"files": [{"name": "catalog.xlsx", "format": ".xlsx", "tables": [
+            {"name": "Sheet1", "max_column": None, "preview": [["code", "name"], ["A", "Coffee"]]}]}]}
+        with patch("business_import.llm._json_call", side_effect=RuntimeError("stop before API")) as call:
+            with self.assertRaisesRegex(RuntimeError, "stop before API"):
+                describe_business(None, inventory)
+        prompt = call.call_args.args[1]
+        template = json.loads(prompt.split("Output template JSON follows:\n", 1)[1].split("\nInput inventory JSON follows:", 1)[0])
+        self.assertEqual(template["tables"][0]["column_types"], ["VARCHAR"] * 2)
+
+    def test_wrong_type_count_keeps_original_values_and_reports_warning(self):
+        for count in (1, 3):
+            response = compact_description()
+            response["tables"][0]["column_types"] = [{"type": "BIGINT"}] * count
+            description, _ = self.describe(self.inventory(), response)
+            self.assertNotIn("column_types", description["tables"][0])
+            conn = duckdb.connect(":memory:")
+            try:
+                raw = [{"source_file": "sales.csv", "source_table": "sales", "format": ".csv",
+                        "columns": ["id", "amount"], "rows": [["001", "10"]]}]
+                plan = build_load_plan([{"name": "_stage_0", "columns": ["id", "amount"], "destination": "sales"}], "biz_1")
+                result = load_business(conn, {"id": "biz_1", "split": "test"}, description, raw, {}, plan)
+                self.assertEqual(conn.execute("SELECT * FROM biz_1.sales").fetchall(), [("001", "10")])
+                warning = f"sales.csv / sales: ignored type hints; expected 2 column_types, got {count}; kept original storage types"
+                self.assertIn(warning, result["warnings"])
+                self.assertIn(warning, json.loads(conn.execute("SELECT warnings FROM _catalog.businesses").fetchone()[0]))
+            finally:
+                conn.close()
+
+    def test_type_notes_are_allowed_without_relaxing_type_validation(self):
+        response = compact_description()
+        response["tables"][0]["column_types"] = [{"type": "VARCHAR", "description": "Order ID"},
+                                                 {"type": "DECIMAL", "description": "Amount"}]
+        result, _ = self.describe(self.inventory(), response)
+        self.assertEqual(result["tables"][0]["column_types"][1]["type"], "DECIMAL")
+        response["tables"][0]["column_types"][0]["description"] = []
+        with self.assertRaises(ValueError):
+            self.describe(self.inventory(), response)
+
+    def test_type_hints_are_requested_and_validated_in_same_call(self):
+        response = compact_description()
+        response["tables"][0]["column_types"] = [{"type": "VARCHAR"}, {"type": "DECIMAL", "thousands_separator": ","}]
+        result, prompt = self.describe(self.inventory(), response)
+        self.assertIn('"column_types"', prompt)
+        instructions = prompt.split("Output template JSON follows:\n")[0]
+        self.assertLess(len(instructions), 3000)
+        for rule in ("Vietnamese or English", "untrusted data", "VARCHAR", "BIGINT", "DECIMAL",
+                     "TIMESTAMP", '"format":"VND"', "excel_serial", "excel_epoch",
+                     "PTTT", "formats", "Python", "timezone", "null"):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, instructions)
+        self.assertEqual(result["tables"][0]["column_types"], response["tables"][0]["column_types"])
+        for specs in ([{"type": "DROP TABLE"}, {"type": "VARCHAR"}], [{"type": []}, {"type": "VARCHAR"}]):
+            response["tables"][0]["column_types"] = specs
+            with self.subTest(specs=specs), self.assertRaises(ValueError):
+                self.describe(self.inventory(), response)
+
+    def test_flattened_table_fields_report_structure_not_missing_description(self):
+        response = compact_description()
+        response["tables"].extend(["source_file", "other.xlsx", "source_table", "Sheet1"])
+        with self.assertRaisesRegex(ValueError, r"tables\[1\] must be an object"):
+            self.describe(self.inventory(), response)
+
+    def test_model_contract_rejects_malformed_responses(self):
+        valid = compact_description()
+        cases = [[], {}, {**valid, "summary": 1}, {**valid, "tables": {}}, {**valid, "tables": [None]},
+                 {**valid, "tables": []}, {**valid, "tables": valid["tables"] * 2},
+                 compact_description(file="unknown.csv"), compact_description(file=[]),
+                 compact_description(header=True), compact_description(header=None),
+                 compact_description(header=0), compact_description(header=4), compact_description(header="1"),
+                 {**valid, "tables": [{**valid["tables"][0], "description": []}]},
+                 {**valid, "rules": "rule"}, {**valid, "relationships": [{}]}, {**valid, "uncertainties": [2]}]
+        for response in cases:
+            with self.subTest(response=response), self.assertRaises(ValueError):
+                self.describe(self.inventory(), response)
+
+    def test_preamble_selection_does_not_assert_heuristic_header(self):
+        inventory = self.inventory()
+        inventory["files"][0]["format"] = ".xlsx"
+        inventory["files"][0]["name"] = "sales.xlsx"
+        rows = [["Report title"], ["Period: all"], [], ["id", "amount"], ["001", 10]]
+        inventory["files"][0]["tables"][0]["preview"] = rows
+        result, prompt = self.describe(inventory, compact_description(file="sales.xlsx", header=4))
+        payload = json.loads(prompt.split("Input inventory JSON follows:\n", 1)[1])
+        self.assertEqual(payload["files"][0]["tables"][0]["preview"], [[1, ["Report title"]], [4, ["id", "amount"]], [5, ["001", 10]]])
+        layout = validate_layout(rows, result["tables"][0])
+        self.assertEqual(layout["preamble"], rows[:3])
+        self.assertEqual(layout["records"], [["001", 10]])
+
+    def test_excel_serial_metadata_reaches_timestamp_loading(self):
+        from datetime import datetime
+        from openpyxl.utils.datetime import CALENDAR_MAC_1904
+        for epoch, serial, expected in ((None, 45717, datetime(2025, 3, 1)),
+                                        (CALENDAR_MAC_1904, 1, datetime(1904, 1, 2))):
+            with self.subTest(epoch=epoch), tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "dates.xlsx"
+                book = Workbook()
+                if epoch is not None:
+                    book.epoch = epoch
+                sheet = book.active
+                sheet.append(["Report"])
+                sheet.append([])
+                sheet.append(["id", "Ngày mua"])
+                sheet.append(["A", serial])
+                sheet.append(["B", "05/03/2025"])
+                book.save(path)
+                book.close()
+                inventory = inspect_business(Path(temp))
+                response = {"tables": [{"source_file": path.name, "source_table": "Sheet", "header_row": 3,
+                    "column_types": ["VARCHAR", {"type": "TIMESTAMP", "formats": ["excel_serial", "%d/%m/%Y"]}]}]}
+                description, prompt = self.describe(inventory, response)
+                payload = json.loads(prompt.split("Input inventory JSON follows:\n", 1)[1])
+                preview = payload["files"][0]["tables"][0]["preview"]
+                self.assertEqual([row[0] for row in preview], [3, 4, 5])
+                self.assertIn("excel_epoch", payload["files"][0]["tables"][0])
+                raw, layouts = _read_tables(inventory, description)
+                conn = duckdb.connect(":memory:")
+                try:
+                    plan = build_load_plan([{"name": "_stage_0", "columns": raw[0]["columns"], "destination": "dates__Sheet"}], "biz_1")
+                    load_business(conn, {"id": "biz_1", "split": "test"}, description, raw, layouts, plan)
+                    self.assertEqual(conn.execute('SELECT "Ngày mua" FROM biz_1.dates__Sheet').fetchall(),
+                                     [(expected,), (datetime(2025, 3, 5),)])
+                finally:
+                    conn.close()
+
+    def test_unknown_layout_is_not_silently_accepted(self):
+        inventory = self.inventory()
+        inventory["files"][0]["tables"][0]["preview"] = [["name", "email"], ["Alice", "a@example.org"]]
+        result, prompt = self.describe(inventory, compact_description())
+        self.assertIn("a@example.org", prompt)
+        with self.assertRaisesRegex(ValueError, "structural"):
+            validate_layout(inventory["files"][0]["tables"][0]["preview"], result["tables"][0])
+
+    def test_sqlite_samples_are_bounded_and_blobs_are_safe(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            with closing(sqlite3.connect(path / "native.sqlite")) as db:
+                db.execute("CREATE TABLE t (id INTEGER, value BLOB)")
+                db.executemany("INSERT INTO t VALUES (?, ?)", [(i, b"abc") for i in range(5)])
+                db.commit()
+            inventory = inspect_business(path)
+            self.assertEqual(inventory["files"][0]["tables"][0]["preview"], [[0, "<blob:3 bytes>"], [1, "<blob:3 bytes>"], [2, "<blob:3 bytes>"]])
+            result, prompt = self.describe(inventory, compact_description("native.sqlite", "t", None))
+            self.assertIsNone(result["tables"][0]["header_row"])
+            self.assertIn("<blob:3 bytes>", prompt)
+            self.assertEqual(read_sqlite_rows(path / "native.sqlite", "t")[0][-1], [4, b"abc"])
+
+    def test_online_cli_loads_all_formats_once_and_preserves_long_values(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "data"
+            business = root / "biz_1"
+            business.mkdir(parents=True)
+            readme = "Business rules: 1 box = 12 units. " * 30
+            (business / "README.md").write_text(readme, encoding="utf-8")
+            long_header, long_value = "Header" * 50, "value" * 100
+            with (business / "sales.csv").open("w", encoding="utf-8", newline="") as stream:
+                csv.writer(stream).writerows([["id", long_header], ["001", long_value], ["002", "2"], ["003", "3"]])
+            book = Workbook()
+            book.active.title = "Sales"
+            book.active.append(["id", "amount"])
+            book.active.append([1, 10])
+            book.create_sheet("Empty")
+            book.save(business / "report.xlsx")
+            (business / "empty.csv").touch()
+            with closing(sqlite3.connect(business / "native.sqlite")) as db:
+                db.execute("CREATE TABLE t (id INTEGER)")
+                db.execute("INSERT INTO t VALUES (7)")
+                db.commit()
+            response = compact_description()
+            response["tables"] += [compact_description("report.xlsx", "Sales")["tables"][0],
+                                    compact_description("report.xlsx", "Empty", None)["tables"][0],
+                                    compact_description("native.sqlite", "t", None)["tables"][0],
+                                    compact_description("empty.csv", "empty", None)["tables"][0]]
+            response["tables"][1]["column_types"] = [{"type": "BIGINT"}, {"type": "DECIMAL"}]
+            prompts, output, errors = [], StringIO(), StringIO()
+            db_path = Path(temp) / "out.duckdb"
+            with patch.dict(os.environ, {"MODEL_API_KEY": "test"}), patch("business_import.llm.create_client", return_value=model_client(response, prompts)), patch("business_import.llm.OUTPUT_DIR", Path(temp) / "responses"), redirect_stdout(output), redirect_stderr(errors):
+                status = main(["--roots", str(root), "--db", str(db_path)])
+            self.assertEqual(status, 0, errors.getvalue())
+            self.assertEqual(len(prompts), 1)
+            self.assertEqual(json.loads(output.getvalue())["status"], "ok")
+            payload = json.loads(prompts[0].split("Input inventory JSON follows:\n", 1)[1])
+            self.assertEqual(payload["readme"], readme)
+            samples = next(f for f in payload["files"] if f["name"] == "sales.csv")["tables"][0]["preview"]
+            self.assertLessEqual(len(samples), 3)
+            self.assertLessEqual(len(samples[0][1][1]), 200)
+            self.assertTrue(samples[0][1][1].endswith("[truncated]"))
+            self.assertLessEqual(len(samples[1][1][1]), 200)
+            with duckdb.connect(str(db_path)) as conn:
+                self.assertEqual(conn.execute('SELECT * FROM biz_1.sales ORDER BY id').fetchall(), [("001", long_value), ("002", "2"), ("003", "3")])
+                self.assertEqual(conn.execute('DESCRIBE biz_1.sales').fetchall()[1][0], long_header)
+                self.assertEqual(conn.execute('SELECT * FROM biz_1.native__t').fetchall(), [(7,)])
+                self.assertEqual(conn.execute('SELECT * FROM biz_1.report__Sales').fetchall(), [(1, 10)])
+                self.assertEqual([row[1] for row in conn.execute('DESCRIBE biz_1.report__Sales').fetchall()], ["BIGINT", "DECIMAL(38,10)"])
+                self.assertEqual(conn.execute('SELECT count(*) FROM biz_1.empty').fetchone(), (0,))
+                self.assertEqual(conn.execute('SELECT count(*) FROM biz_1.report__Empty').fetchone(), (0,))
+                stored = conn.execute('SELECT readme, description_json FROM _catalog.businesses').fetchone()
+                self.assertEqual(stored[0], readme)
+                self.assertEqual(json.loads(stored[1])["summary"], "Sales business")
+            # An invalid reimport must leave the previous business untouched.
+            response["tables"][0]["header_row"] = None
+            with patch("business_import.llm.create_client", return_value=model_client(response, [])), patch("business_import.llm.OUTPUT_DIR", Path(temp) / "responses"), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                self.assertEqual(main(["--roots", str(root), "--db", str(db_path)]), 1)
+            with duckdb.connect(str(db_path)) as conn:
+                self.assertEqual(conn.execute('SELECT count(*) FROM biz_1.sales').fetchone(), (3,))
+
+    def test_only_exact_repeated_headers_are_excluded_and_reported(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            (path / "sales.csv").write_text("id,amount\n001,10\nid,amount\nid,20\n", encoding="utf-8")
+            inventory = inspect_business(path)
+            response = compact_description()
+            result, _ = self.describe(inventory, response)
+            raw, layouts = _read_tables(inventory, result)
+            self.assertEqual(raw[0]["rows"], [["001", "10"], ["id", "20"]])
+            self.assertEqual(layouts[("sales.csv", "sales")]["repeated_header_count"], 1)
+            with duckdb.connect(":memory:") as conn:
+                plan = build_load_plan([{"name": "_stage_0", "columns": ["id", "amount"], "destination": "sales"}], "biz_1")
+                loaded = load_business(conn, {"id": "biz_1", "split": "train"}, result, raw, layouts, plan)
+                self.assertTrue(any("1 repeated header" in warning for warning in loaded["warnings"]))
+
+    def test_offline_cli_never_calls_model(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "data"
+            business = root / "biz_1"
+            business.mkdir(parents=True)
+            (business / "sales.csv").write_text("id,amount\n001,10\n", encoding="utf-8")
+            db_path = Path(temp) / "out.duckdb"
+            with patch("business_import.llm.create_client", side_effect=AssertionError("offline contacted model")), redirect_stdout(StringIO()):
+                self.assertEqual(main(["--offline", "--roots", str(root), "--db", str(db_path)]), 0)
+            with duckdb.connect(str(db_path)) as conn:
+                self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [("001", "10")])
+
+
 
 
 class SourceTests(unittest.TestCase):
@@ -266,106 +667,6 @@ class SqlTests(unittest.TestCase):
 
 
 class LlmTests(unittest.TestCase):
-    def test_uncertain_customer_rows_are_never_sent_to_model(self):
-        inventory = {"files": [{"name": "x.csv", "format": ".csv", "tables": [{"name": "x", "preview": [["Alice", "alice@example.org"], ["Bob", "42"], ["Carol", "43"]]}]}]}
-        response = {"tables": [{"source_file": "x.csv", "source_table": "x"}]}
-        with patch("business_import.llm._json_call", return_value=response) as call:
-            describe_business(object(), inventory)
-        prompt = call.call_args.args[1]
-        self.assertNotIn("Alice", prompt)
-        self.assertNotIn("alice@example.org", prompt)
-
-    def test_description_rejects_fabricated_source(self):
-        inventory = {"files": [{"name": "sales.csv", "tables": [{"name": "sales"}]}]}
-        with patch("business_import.llm._json_call", return_value={"tables": [{"source_file": "other.csv", "source_table": "sales"}]}):
-            with self.assertRaisesRegex(ValueError, "unknown"):
-                describe_business(object(), inventory)
-
-    def test_csv_header_preview_exposes_only_local_candidate(self):
-        inventory = {"files": [{"name": "x.csv", "format": ".csv", "tables": [{"name": "x", "preview": [["id", "email"], ["001", "alice@example.org"]]}]}]}
-        response = {"tables": [{"source_file": "x.csv", "source_table": "x"}]}
-        with patch("business_import.llm._json_call", return_value=response) as call:
-            describe_business(object(), inventory)
-        prompt = call.call_args.args[1]
-        self.assertIn('"id"', prompt)
-        self.assertIn('"email"', prompt)
-        self.assertNotIn("alice@example.org", prompt)
-
-    def test_first_call_sends_compact_inventory_and_candidate_rows_only(self):
-        preview = [["id", "customer"], *[[str(i), f"private-{i}"] for i in range(1, 40)]]
-        inventory = {"id": "biz_1", "path": Path("/ignored"), "readme": "business notes",
-                     "files": [{"name": "sales.csv", "format": ".csv", "delimiter": ",", "debug": "omit",
-                                "tables": [{"name": "sales", "row_count": 39, "max_column": 2,
-                                            "preview": preview, "internal_metadata": "omit"}]}]}
-        response = {"tables": [{"source_file": "sales.csv", "source_table": "sales"}]}
-        with patch("business_import.llm._json_call", return_value=response) as call:
-            describe_business(object(), inventory)
-        prompt = call.call_args.args[1]
-        payload = json.loads(prompt.split("Input inventory JSON follows:\n", 1)[1])
-        self.assertEqual(payload["readme"], "business notes")
-        self.assertNotIn("path", payload)
-        self.assertNotIn("debug", payload["files"][0])
-        table = payload["files"][0]["tables"][0]
-        self.assertNotIn("internal_metadata", table)
-        self.assertNotIn("candidate_header_rows", table)
-        self.assertEqual(len(table["preview"]), 3)
-        self.assertEqual(table["preview"][0]["cells"], ["id", "customer"])
-        self.assertEqual([row["row"] for row in table["preview"]], [1, 2, 3])
-        self.assertEqual(table["preview"][2]["kind"], "masked_sample")
-        self.assertNotIn("private-", prompt)
-
-    def test_repeated_excel_data_rows_are_not_sent_as_candidate_headers(self):
-        headers = ["Order ID", "Customer", "Quantity"]
-        rows = [headers] + [[f"ORD{i:06}", f"Customer {i}", i if i % 2 else f"{i} packs"]
-                            for i in range(1, 40)]
-        inventory = {"files": [{"name": "orders.xlsx", "format": ".xlsx", "tables": [
-            {"name": "Sheet1", "preview": rows, "row_count": 40, "max_row": 40, "max_column": 3}
-        ]}]}
-        response = {"tables": [{"source_file": "orders.xlsx", "source_table": "Sheet1"}]}
-        with patch("business_import.llm._json_call", return_value=response) as call:
-            describe_business(object(), inventory)
-        prompt = call.call_args.args[1]
-        payload = json.loads(prompt.split("Input inventory JSON follows:\n", 1)[1])
-        preview = payload["files"][0]["tables"][0]["preview"]
-        self.assertLessEqual(len(preview), 3)
-        self.assertEqual(preview[0]["kind"], "candidate_header")
-        self.assertEqual(preview[0]["cells"], headers)
-        self.assertNotIn("ORD000001", prompt)
-        self.assertNotIn("Customer 1", prompt)
-        self.assertEqual(sum(row["kind"] == "candidate_header" for row in preview), 1)
-
-    def test_description_sends_header_and_one_masked_data_row_only(self):
-        inventory = {"files": [{"name": "sales.csv", "format": ".csv", "tables": [{"name": "sales", "preview": [
-            ["id", "customer"], ["001", "FIRST_PRIVATE"], ["002", "SECOND_PRIVATE"], ["003", "THIRD_PRIVATE"]
-        ]}]}]}
-        response = {"tables": [{"source_file": "sales.csv", "source_table": "sales"}]}
-        with patch("business_import.llm._json_call", return_value=response) as call:
-            describe_business(object(), inventory)
-        prompt = call.call_args.args[1]
-        self.assertIn('"id"', prompt)
-        self.assertIn('"customer"', prompt)
-        self.assertIn('"row": 2', prompt)
-        self.assertNotIn("FIRST_PRIVATE", prompt)
-        self.assertNotIn("SECOND_PRIVATE", prompt)
-        self.assertNotIn("THIRD_PRIVATE", prompt)
-        self.assertIn('"row": 3', prompt)
-        self.assertNotIn('"row": 4', prompt)
-        self.assertIn('"kind": "masked_sample"', prompt)
-
-    def test_description_masks_row_values_and_validates_coverage(self):
-        inventory = {"files": [{"name": "sales.csv", "tables": [{"name": "sales", "preview": [["id", "customer"], ["001", "private"]]}]}]}
-        response = {"tables": [{"source_file": "sales.csv", "source_table": "sales"}]}
-        with patch("business_import.llm._json_call", return_value=response) as call:
-            result = describe_business(object(), inventory)
-        self.assertNotIn("private", call.call_args.args[1])
-        self.assertEqual(len(result["tables"]), 1)
-
-    def test_second_call_proposes_sql(self):
-        response = {"tables": [{"source": "_stage_0", "destination": "sales", "columns": ["id"], "sql": 'CREATE TABLE "biz_1"."sales" AS SELECT "id" FROM "_stage_0"'}]}
-        with patch("business_import.llm._json_call", return_value=response):
-            result = generate_load_sql(object(), {"summary": "x"}, [{"name": "_stage_0", "columns": ["id"]}], "biz_1")
-        self.assertEqual(result, response)
-
     def test_each_model_call_saves_raw_output_to_llm_out(self):
         from tempfile import TemporaryDirectory
         from pathlib import Path

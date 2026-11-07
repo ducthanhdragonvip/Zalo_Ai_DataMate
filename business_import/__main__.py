@@ -45,21 +45,26 @@ def _read_tables(inventory, description):
             if fmt == ".xlsx" and table.get("is_empty", False):
                 raw.append({"source_file": file["name"], "source_table": table["name"], "format": fmt, "columns": ["column_1"], "rows": []})
                 continue
+            excel_epoch = None
             if fmt == ".csv":
                 rows = _read_csv_grid(source_path, file["delimiter"])
             else:
                 from openpyxl import load_workbook
                 workbook = load_workbook(source_path, read_only=True, data_only=False)
                 try:
+                    excel_epoch = workbook.epoch.date().isoformat()
                     rows = [[sources._value(v) for v in row] for row in workbook[table["name"]].iter_rows(values_only=True)]
                 finally:
                     workbook.close()
             layout = layouts.validate_layout(rows, proposal)
             validated_layouts[key] = layout
             columns = sources._unique(layout["headers"])
-            values = layout["records"]
+            header = rows[layout["header_row"] - 1]
+            values = [row for row in layout["records"] if row != header]
+            layout["repeated_header_count"] = len(layout["records"]) - len(values)
             raw.append({"source_file": file["name"], "source_table": table["name"], "format": fmt,
-                        "columns": columns, "rows": [[_to_text(v, fmt) for v in row] for row in values]})
+                        "columns": columns, "excel_epoch": excel_epoch,
+                        "rows": [[_to_text(v, fmt) for v in row] for row in values]})
     return raw, validated_layouts
 
 
@@ -151,8 +156,7 @@ def run(args):
                 schema_name = business["id"]
                 used = set()
                 staging = [{"name": f"_stage_{i}", "columns": t["columns"], "destination": _dest(t, used)} for i, t in enumerate(raw)]
-                load_plan = sql.build_load_plan(staging, schema_name) if args.offline else sql.validate_load_plan(
-                    llm.generate_load_sql(client, description, staging, schema_name), staging, schema_name)
+                load_plan = sql.build_load_plan(staging, schema_name)
                 result = database.load_business(conn, business, description, raw, layout_by_source, load_plan)
                 print(json.dumps({"status": "ok", **result}, ensure_ascii=False))
             except Exception as exc:

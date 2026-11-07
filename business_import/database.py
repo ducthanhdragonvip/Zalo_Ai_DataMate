@@ -3,6 +3,7 @@ import re
 from datetime import datetime, timezone
 
 from .sql import quote_identifier, validate_load_plan
+from .column_types import convert_columns, validate_specs
 
 
 def _schema(name):
@@ -58,6 +59,9 @@ def load_business(conn, business, description, raw_tables, layout_by_source, loa
     """Load one business atomically. raw_tables: [{source_file, source_table, format, columns, rows}]."""
     schema = _schema(business["id"])
     tables, used = [], set()
+    descriptions = {(t["source_file"], t["source_table"]): t for t in description.get("tables", [])}
+    warnings = [f"{file} / {table}: excluded {layout['repeated_header_count']} repeated header rows"
+                for (file, table), layout in layout_by_source.items() if layout.get("repeated_header_count")]
     for raw in raw_tables:
         name = _table_name(raw["source_file"], {"name": raw["source_table"]}, raw["format"], used)
         tables.append({**raw, "stage": f"_stage_{len(tables)}", "destination": name})
@@ -75,14 +79,33 @@ def load_business(conn, business, description, raw_tables, layout_by_source, loa
         conn.execute(f"CREATE SCHEMA IF NOT EXISTS {quote_identifier(schema)}")
         for table in tables:
             source_types = table.get("column_types", [])
-            definitions = ", ".join(quote_identifier(c) + " " + _sqlite_type(table.get("declared_types", [""] * len(table["columns"]))[i], source_types[i]) if table["format"] == ".sqlite" and i < len(source_types) else quote_identifier(c) + " VARCHAR" for i, c in enumerate(table["columns"]))
+            default_types = [_sqlite_type(table.get("declared_types", [""] * len(table["columns"]))[i], source_types[i])
+                             if table["format"] == ".sqlite" and i < len(source_types) else "VARCHAR"
+                             for i in range(len(table["columns"]))]
+            proposal = descriptions.get((table["source_file"], table["source_table"]), {})
+            specs = proposal.get("column_types")
+            protected_warnings = list(proposal.get("type_hint_warnings", []))
+            if specs is not None:
+                validate_specs(specs, len(table["columns"]))
+                specs = [dict(spec) for spec in specs]
+                for i, observed in enumerate(source_types):
+                    if len(observed) > 1 and specs[i]["type"] != "VARCHAR":
+                        specs[i] = {"type": "VARCHAR"}
+                        protected_warnings.append(f"{table['columns'][i]}: kept VARCHAR; mixed SQLite storage types")
+            actual_types, values, type_warnings = convert_columns(table["columns"], table["rows"], specs, default_types,
+                                                                 excel_epoch=table.get("excel_epoch") if table["format"] == ".xlsx" else None)
+            type_warnings = protected_warnings + type_warnings
+            proposal["actual_types"] = actual_types
+            proposal["type_warnings"] = type_warnings
+            warnings.extend(f"{table['source_file']} / {table['source_table']}: {warning}" for warning in type_warnings)
+            definitions = ", ".join(quote_identifier(c) + " " + kind for c, kind in zip(table["columns"], actual_types))
             conn.execute(f"CREATE OR REPLACE TEMP TABLE {quote_identifier(table['stage'])} ({definitions})")
             if table["rows"]:
                 placeholders = ",".join("?" for _ in table["columns"])
                 source_types = table.get("column_types", [])
                 conn.executemany(f"INSERT INTO {quote_identifier(table['stage'])} VALUES ({placeholders})", [
                     [_sqlite_value(value, source_types[i]) if table["format"] == ".sqlite" and i < len(source_types) else value for i, value in enumerate(row)]
-                    for row in table["rows"]])
+                    for row in values])
 
         prior = conn.execute('SELECT table_name FROM "_catalog".tables WHERE business_id=?', [business["id"]]).fetchall()
         current_names = {entry["destination"].casefold() for entry in accepted_plan["tables"]}
@@ -106,7 +129,7 @@ def load_business(conn, business, description, raw_tables, layout_by_source, loa
         conn.execute('DELETE FROM "_catalog".tables WHERE business_id=?', [business["id"]])
         conn.execute('DELETE FROM "_catalog".businesses WHERE business_id=?', [business["id"]])
         conn.execute('INSERT INTO "_catalog".businesses VALUES (?, ?, ?, ?, ?, ?, ?)', [business["id"], business["split"], business.get("readme", ""),
-            json.dumps(description, ensure_ascii=False, default=str), "loaded", datetime.now(timezone.utc).isoformat(), ""])
+            json.dumps(description, ensure_ascii=False, default=str), "loaded", datetime.now(timezone.utc).isoformat(), json.dumps(warnings, ensure_ascii=False)])
         tables_by_stage = {table["stage"]: table for table in tables}
         for entry in accepted_plan["tables"]:
             table = tables_by_stage[entry["source"]]
@@ -116,7 +139,7 @@ def load_business(conn, business, description, raw_tables, layout_by_source, loa
             conn.execute('INSERT INTO "_catalog".tables VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [business["id"], table["source_file"], table["source_table"], entry["destination"], count,
                 json.dumps(mapping, ensure_ascii=False), json.dumps(layout.get("preamble", []), ensure_ascii=False, default=str), entry["sql"]])
         conn.execute("COMMIT")
-        return {"business_id": business["id"], "tables": len(tables), "rows": sum(len(t["rows"]) for t in tables)}
+        return {"business_id": business["id"], "tables": len(tables), "rows": sum(len(t["rows"]) for t in tables), "warnings": warnings}
     except Exception:
         conn.execute("ROLLBACK")
         raise
