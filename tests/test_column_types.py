@@ -20,6 +20,33 @@ class ColumnTypeTests(unittest.TestCase):
         load_business(conn, {"id": "biz_1", "split": "train"}, description, raw, {}, plan)
         return conn
 
+    def test_only_final_timestamp_outlier_is_excluded_without_label_rules(self):
+        for label in ['Tổng cộng', 'arbitrary footer']:
+            conn = self.load([['04/02/2025'], ['05/02/2025'], [label]], [{'type': 'TIMESTAMP'}])
+            self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(),
+                             [(datetime(2025, 2, 4),), (datetime(2025, 2, 5),)])
+            desc = json.loads(conn.execute('SELECT description_json FROM _catalog.businesses').fetchone()[0])
+            self.assertEqual(desc['tables'][0]['excluded_trailing_row']['values'], [label])
+        for rows in [[['bad'], ['04/02/2025'], ['footer']], [[''], ['footer']], [['04/02/2025'], ['footer'], ['footer']]]:
+            conn = self.load(rows, [{'type': 'TIMESTAMP'}])
+            self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [tuple(row) for row in rows])
+        conn = self.load([['04/02/2025'], ['footer']], [{'type': 'VARCHAR'}])
+        self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [('04/02/2025',), ('footer',)])
+
+    def test_space_grouped_numbers_convert_without_losing_text_or_bad_values(self):
+        for spec in [{'type': 'BIGINT'}, {'type': 'DECIMAL'}, {'type': 'DECIMAL', 'format': 'VND'}]:
+            with self.subTest(spec=spec):
+                conn = self.load([['174 000'], ['1 149 000'], ['0'], [None]], [spec])
+                self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [(174000,), (1149000,), (0,), (None,)])
+                for bad in ['17 40', '01 000', '1  149 000']:
+                    rows = [['174 000'], [bad]]
+                    conn = self.load(rows, [spec])
+                    self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [tuple(row) for row in rows])
+        conn = self.load([['174 000']], [{'type': 'VARCHAR'}])
+        self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [('174 000',)])
+        conn = self.load([['174 000,50'], ['1 149 000,25']], [{'type': 'DECIMAL', 'decimal_separator': ','}])
+        self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [(Decimal('174000.50'),), (Decimal('1149000.25'),)])
+
     def test_loads_validated_types_without_raw_duplicate(self):
         conn = self.load([["1 thg 6 2025", "1.234,50", "12", "true", "2025-06-01 12:30:00"]], [
             {"type": "DATE", "format": "%d thg %m %Y"},
@@ -35,16 +62,28 @@ class ColumnTypeTests(unittest.TestCase):
         self.assertEqual(json.loads(warnings), [])
 
     def test_invalid_late_values_and_padded_ids_keep_entire_column(self):
-        rows = [["2025-01-01", "00123", "10"], ["2025-02-30", "00456", "oops"]]
+        rows = [["2025-01-01", "00123", "10"], ["2025-02-30", "00456", "oops"], ["2025-03-01", "00789", "20"]]
         conn = self.load(rows, [{"type": "DATE", "format": "%Y-%m-%d"}, {"type": "BIGINT"}, {"type": "BIGINT"}])
         self.assertEqual(conn.execute("SELECT * FROM biz_1.sales").fetchall(), [tuple(row) for row in rows])
         self.assertEqual([row[1] for row in conn.execute("DESCRIBE biz_1.sales").fetchall()], ["VARCHAR"] * 3)
         warnings = json.loads(conn.execute("SELECT warnings FROM _catalog.businesses").fetchone()[0])
         self.assertEqual(len(warnings), 3)
 
-    def test_no_loss_from_blanks_overflow_precision_or_ambiguous_grouping(self):
-        values = ["", "9223372036854775808", "0.12345678901", "12,34", "NaN", "01"]
-        specs = [{"type": "BIGINT"}, {"type": "BIGINT"}, {"type": "DECIMAL"},
+    def test_empty_numeric_cells_become_null_but_invalid_columns_stay_original(self):
+        for spec, amount in [({'type': 'BIGINT'}, '13000'), ({'type': 'DECIMAL'}, '13000'),
+                             ({'type': 'DECIMAL'}, '13.000đ'), ({'type': 'DECIMAL', 'format': 'VND'}, '13.000đ')]:
+            with self.subTest(spec=spec, amount=amount):
+                conn = self.load([[amount], [''], [None]], [spec])
+                self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [(13000,), (None,), (None,)])
+                rows = [[amount], [''], ['invalid']]
+                conn = self.load(rows, [spec])
+                self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [tuple(row) for row in rows])
+        conn = self.load([['']], [{'type': 'VARCHAR'}])
+        self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [('',)])
+
+    def test_no_loss_from_overflow_precision_or_ambiguous_grouping(self):
+        values = [ "9223372036854775808", "0.12345678901", "12,34", "NaN", "01"]
+        specs = [{"type": "BIGINT"}, {"type": "DECIMAL"},
                  {"type": "DECIMAL", "thousands_separator": ","}, {"type": "DECIMAL"}, {"type": "DECIMAL"}]
         conn = self.load([values], specs)
         self.assertEqual(conn.execute("SELECT * FROM biz_1.sales").fetchone(), tuple(values))
@@ -274,7 +313,7 @@ class ColumnTypeTests(unittest.TestCase):
 
     def test_automatic_currency_parsing_preserves_unsafe_whole_columns(self):
         from business_import.column_types import convert_columns
-        for invalid in ("25k + 5k", "USD 10", "00123", "", "1e40tr"):
+        for invalid in ("25k + 5k", "USD 10", "00123", " ", "1e40tr"):
             source = [["17k"], [invalid]]
             with self.subTest(invalid=invalid):
                 types, values, warnings = convert_columns(["any name"], source, [{"type": "DECIMAL"}], ["VARCHAR"])
@@ -320,7 +359,7 @@ class ColumnTypeTests(unittest.TestCase):
     def test_iso_timestamp_promotion_still_validates_whole_column(self):
         for invalid in ("2025-02-30T06:02:07", "2025-03-01T06:02:07+07:00", "oops"):
             with self.subTest(invalid=invalid):
-                source = [["2025-03-01T06:02:07.123456"], [invalid]]
+                source = [["2025-03-01T06:02:07.123456"], [invalid], ["2025-03-02T06:02:07"]]
                 conn = self.load(source, [{"type": "DATE", "format": "%Y-%m-%d"}])
                 self.assertEqual(conn.execute("SELECT * FROM biz_1.sales").fetchall(), [tuple(row) for row in source])
 

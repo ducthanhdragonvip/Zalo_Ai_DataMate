@@ -34,6 +34,24 @@ class ReadmeImportTests(unittest.TestCase):
                                        {'readme': readme, 'files': files or []})
         return result, requests[0]
 
+    def test_csv_timestamp_columns_accept_excel_serial_dates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / 'data'
+            path = root / 'biz_1'
+            path.mkdir(parents=True)
+            (path / 'README.md').write_text('- **Date**: event date\n- **Code**: identifier\n- **Qty**: count', encoding='utf-8')
+            (path / 'dates.csv').write_text('Date,Code,Qty\n45692,45692,45692\n05/02/2025,002,2\n,003,3\n', encoding='utf-8')
+            (path / 'invalid.csv').write_text('Date,Code,Qty\n45692,001,1\n60,002,2\n', encoding='utf-8')
+            response = {'columns': [{'name': 'Date', 'type': 'TIMESTAMP'},
+                                    {'name': 'Code', 'type': 'VARCHAR'}, {'name': 'Qty', 'type': 'BIGINT'}]}
+            database = Path(temp) / 'out.duckdb'
+            with patch('business_import.llm.create_client', return_value=response_client(response, [])), patch('business_import.llm.OUTPUT_DIR', Path(temp) / 'responses'), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                self.assertEqual(main(['--roots', str(root), '--db', str(database)]), 0)
+            with duckdb.connect(str(database)) as conn:
+                self.assertEqual(conn.execute('SELECT * FROM biz_1.dates').fetchall(), [
+                    (datetime(2025, 2, 4), '45692', 45692), (datetime(2025, 2, 5), '002', 2), (None, '003', 3)])
+                self.assertEqual(conn.execute('SELECT Date FROM biz_1.invalid').fetchall(), [('45692',), ('60',)])
+
     def test_source_headers_extend_unique_readme_candidates(self):
         requests = []
         columns = [{'name': 'Amount', 'type': 'DECIMAL'}, {'name': 'Mã', 'type': 'VARCHAR'}]
@@ -107,6 +125,27 @@ class ReadmeImportTests(unittest.TestCase):
             self.assertEqual(raw[0]['columns'], ['column_1', 'column_2', 'column_3'])
             self.assertEqual(raw[0]['rows'], records)
             self.assertTrue(any('all rows' in warning for warning in description['tables'][0]['type_hint_warnings']))
+
+    def test_trailing_total_is_excluded_but_arbitrary_invalid_dates_remain(self):
+        from business_import.column_types import convert_columns
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            (path / 'README.md').write_text('- **Ngày**: date\n- **Amount**: money', encoding='utf-8')
+            for last in [['Tổng cộng', 26000], ['invalid date', 13000]]:
+                book = Workbook()
+                sheet = book.active
+                sheet.append(['Ngày', 'Amount'])
+                sheet.append([45692, 13000])
+                sheet.append(last)
+                sheet.append(['Ghi chú: report', None])
+                book.save(path / 'report.xlsx')
+                book.close()
+                description = {'columns': [{'name': 'Ngày', 'type': 'TIMESTAMP'}]}
+                raw, _ = _read_tables(inspect_business(path), description)
+                proposal = description['tables'][0]
+                # Reading preserves the row; type validation decides exclusion during loading.
+                self.assertEqual(raw[0]['rows'][-1], [str(value) for value in last])
+                self.assertNotIn('footer_totals', proposal)
 
     def test_trailing_excel_notes_are_preserved_outside_date_records(self):
         from business_import.column_types import convert_columns

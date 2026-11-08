@@ -37,6 +37,8 @@ def validate_specs(specs, count):
 def _convert(value, spec):
     if value is None or spec["type"] == "VARCHAR":
         return value
+    if value == "" and spec["type"] in {"BIGINT", "DECIMAL"}:
+        return None
     if not isinstance(value, (str, int, float, bool)):
         raise ValueError("unsupported source value")
     text = str(value).strip()
@@ -66,6 +68,9 @@ def _convert(value, spec):
     if thousands:
         integer = rf"(?:{integer}|[1-9][0-9]{{0,2}}(?:{re.escape(thousands)}[0-9]{{3}})+)"
     fraction = rf"(?:{re.escape(decimal)}[0-9]+)?" if kind == "DECIMAL" else ""
+    # ponytail: only single ASCII spaces between three-digit groups; other spacing stays text.
+    if re.fullmatch(rf"[+-]?[1-9][0-9]{{0,2}}(?: [0-9]{{3}})+{fraction}", text):
+        text = text.replace(" ", "")
     if not re.fullmatch(rf"[+-]?{integer}{fraction}", text):
         raise ValueError("ambiguous numeric value or padded identifier")
     normalized = text.replace(thousands, "") if thousands else text
@@ -118,9 +123,11 @@ def _date_from_formats(value, formats, excel_epoch=None, sheet_period=None):
 
 
 def _vnd_amount(value):
-    if value is None:
+    if value is None or value == "":
         return None
     text = str(value).strip().casefold()
+    if not text:
+        raise ValueError("whitespace-only amount")
     # ponytail: embedded millions require three thousand digits; expand only with documented examples.
     if match := re.fullmatch(r"([+-]?(?:0|[1-9][0-9]*))tr([0-9]{3})", text):
         text = f"{match[1]}.{match[2]}tr"

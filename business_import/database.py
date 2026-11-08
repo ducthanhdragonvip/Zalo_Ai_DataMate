@@ -92,9 +92,28 @@ def load_business(conn, business, description, raw_tables, layout_by_source, loa
                     if len(observed) > 1 and specs[i]["type"] != "VARCHAR":
                         specs[i] = {"type": "VARCHAR"}
                         protected_warnings.append(f"{table['columns'][i]}: kept VARCHAR; mixed SQLite storage types")
+            # ponytail: CSV serial dates assume Excel's 1900 system; add an epoch option for 1904 exports.
+            excel_epoch = "1899-12-30" if table["format"] == ".csv" else table.get("excel_epoch") if table["format"] == ".xlsx" else None
             actual_types, values, type_warnings = convert_columns(table["columns"], table["rows"], specs, default_types,
-                                                                 excel_epoch=table.get("excel_epoch") if table["format"] == ".xlsx" else None,
+                                                                 excel_epoch=excel_epoch,
                                                                  sheet_name=table["source_table"] if table["format"] == ".xlsx" else None)
+            # ponytail: exclude at most one trailing date outlier; interior/multiple failures remain untouched.
+            if specs and table["format"] in {".csv", ".xlsx"} and len(table["rows"]) > 1:
+                failed_dates = [i for i, spec in enumerate(specs)
+                                if spec["type"] in {"DATE", "TIMESTAMP"} and actual_types[i] != "TIMESTAMP"
+                                and isinstance(table["rows"][-1][i], str) and table["rows"][-1][i].strip()
+                                and not re.match(r"[+\-0-9]", table["rows"][-1][i].strip())]
+                if failed_dates:
+                    prefix_types, prefix_values, prefix_warnings = convert_columns(
+                        table["columns"], table["rows"][:-1], specs, default_types,
+                        excel_epoch=excel_epoch,
+                        sheet_name=table["source_table"] if table["format"] == ".xlsx" else None)
+                    if all(prefix_types[i] == "TIMESTAMP" and any(row[i] is not None for row in prefix_values)
+                           for i in failed_dates):
+                        proposal["excluded_trailing_row"] = {"values": table["rows"][-1]}
+                        table["rows"] = table["rows"][:-1]
+                        actual_types, values, type_warnings = prefix_types, prefix_values, prefix_warnings
+                        protected_warnings.append("excluded final row: non-date value after a valid timestamp column; preserved in catalog metadata")
             type_warnings = protected_warnings + type_warnings
             proposal["actual_types"] = actual_types
             proposal["type_warnings"] = type_warnings
