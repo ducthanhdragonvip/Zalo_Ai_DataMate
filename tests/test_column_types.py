@@ -107,12 +107,18 @@ class ColumnTypeTests(unittest.TestCase):
             types, rows, warnings = convert_columns(["anything"], [[value]], [spec], ["VARCHAR"], excel_epoch="1899-12-30")
             self.assertEqual(types, ["VARCHAR"])
 
-    def test_date_keywords_override_non_temporal_hints_locally(self):
+    def test_date_names_do_not_override_text_recommendations(self):
+        from business_import.column_types import convert_columns
+        for specs in (None, [{"type": "VARCHAR"}]):
+            self.assertEqual(convert_columns(["Ngày nhập"], [["01/03/2025"]], specs, ["VARCHAR"]),
+                             (["VARCHAR"], [["01/03/2025"]], []))
+
+    def test_formatless_timestamp_uses_local_formats(self):
         from business_import.column_types import convert_columns
         source = [["01/03/2025"], ["1 thg 3 2025"], ["2025-03-01T06:02:07"], [None]]
         for column in ("Ngày nhập", "Ghi nhận THỜI GIAN", "Giờ tạo", "Sinh nhật",
                        "Hạn sử dụng", "purchase_date", "created_at", "NGAY MUA", "thoi gian tao"):
-            for specs in (None, [{"type": "VARCHAR"}], [{"type": "BIGINT"}]):
+            for specs in ([{"type": "TIMESTAMP"}],):
                 with self.subTest(column=column, specs=specs):
                     types, rows, warnings = convert_columns([column], source, specs, ["VARCHAR"])
                     self.assertEqual(types, ["TIMESTAMP"])
@@ -123,7 +129,7 @@ class ColumnTypeTests(unittest.TestCase):
     def test_date_keyword_rule_preserves_unsafe_columns(self):
         from business_import.column_types import convert_columns
         for source in ([["01/03/2025"], ["bad"]], [["06:02:07"]], [["2025-03-01T06:02:07+07:00"]]):
-            types, rows, warnings = convert_columns(["Ngày nhập"], source, None, ["VARCHAR"])
+            types, rows, warnings = convert_columns(["Ngày nhập"], source, [{"type": "TIMESTAMP"}], ["VARCHAR"])
             self.assertEqual(types, ["VARCHAR"])
             self.assertEqual(rows, source)
             self.assertTrue(warnings)
@@ -133,7 +139,7 @@ class ColumnTypeTests(unittest.TestCase):
     def test_date_keyword_rule_uses_verified_excel_epoch(self):
         from business_import.column_types import convert_columns
         source = [["45717"], ["05/03/2025"]]
-        types, rows, warnings = convert_columns(["Ngày mua"], source, None, ["VARCHAR"], excel_epoch="1899-12-30")
+        types, rows, warnings = convert_columns(["Ngày mua"], source, [{"type": "TIMESTAMP"}], ["VARCHAR"], excel_epoch="1899-12-30")
         self.assertEqual(types, ["TIMESTAMP"])
         self.assertEqual(rows, [[datetime(2025, 3, 1)], [datetime(2025, 3, 5)]])
         self.assertFalse(warnings)
@@ -177,6 +183,65 @@ class ColumnTypeTests(unittest.TestCase):
             [{"type": "DECIMAL", "format": "VND"}], ["VARCHAR"])
         self.assertEqual(types, ["DECIMAL(38,10)"])
         self.assertEqual(rows, [[Decimal("1287000")], [Decimal("2000000")], [Decimal("1500000")], [None]])
+        self.assertFalse(warnings)
+
+    def test_yearless_dates_use_matching_sheet_period(self):
+        from business_import.column_types import convert_columns
+        source = [['5/6'], ['2025-06-06 12:30:00'], ['45813'], ['']]
+        for sheet in ('T6_2025', 'T06-2025'):
+            types, values, warnings = convert_columns(['Ngày'], source, [{'type': 'TIMESTAMP'}],
+                ['VARCHAR'], excel_epoch='1899-12-30', sheet_name=sheet)
+            self.assertEqual(types, ['TIMESTAMP'])
+            self.assertEqual(values[0], [datetime(2025, 6, 5)])
+            self.assertEqual(values[1], [datetime(2025, 6, 6, 12, 30)])
+            self.assertIsNone(values[3][0])
+            self.assertFalse(warnings)
+        for sheet, value in (('Sheet1', '5/6'), ('T5_2025', '5/6'), ('T6_2025', '31/6'),
+                             ('T13_2025', '5/6'), ('T2_2025', '29/2')):
+            types, values, warnings = convert_columns(['Ngày'], [[value]], [{'type': 'TIMESTAMP'}],
+                ['VARCHAR'], sheet_name=sheet)
+            self.assertEqual(types, ['VARCHAR'])
+            self.assertEqual(values, [[value]])
+            self.assertTrue(warnings)
+        types, values, _ = convert_columns(['Ngày'], [['29/2']], [{'type': 'TIMESTAMP'}],
+            ['VARCHAR'], sheet_name='T2_2024')
+        self.assertEqual(values, [[datetime(2024, 2, 29)]])
+        types, values, _ = convert_columns(['Ngày'], [['5/6']], [{'type': 'VARCHAR'}],
+            ['VARCHAR'], sheet_name='T6_2025')
+        self.assertEqual(values, [['5/6']])
+
+    def test_mixed_timestamp_formats_allow_empty_cells(self):
+        from business_import.column_types import convert_columns
+        source = [['04/01/2025'], ['2025-01-04 00:00:00'], [''], [None]]
+        types, values, warnings = convert_columns(['Ngày tháng'], source, [{'type': 'TIMESTAMP'}], ['VARCHAR'])
+        self.assertEqual(types, ['TIMESTAMP'])
+        self.assertEqual(values, [[datetime(2025, 1, 4)], [datetime(2025, 1, 4)], [None], [None]])
+        self.assertFalse(warnings)
+        invalid = source + [['31/02/2025']]
+        types, values, warnings = convert_columns(['Ngày tháng'], invalid, [{'type': 'TIMESTAMP'}], ['VARCHAR'])
+        self.assertEqual(types, ['VARCHAR'])
+        self.assertEqual(values, invalid)
+        self.assertTrue(warnings)
+
+    def test_embedded_million_notation(self):
+        from business_import.column_types import convert_columns
+        source = [["1tr360"], ["2TR005"], ["-1tr360"], [None]]
+        expected = [[Decimal("1360000")], [Decimal("2005000")], [Decimal("-1360000")], [None]]
+        for spec in ({"type": "DECIMAL"}, {"type": "DECIMAL", "format": "VND"}):
+            with self.subTest(spec=spec):
+                types, values, warnings = convert_columns(["Amount"], source, [spec], ["VARCHAR"])
+                self.assertEqual(types, ["DECIMAL(38,10)"])
+                self.assertEqual(values, expected)
+                self.assertFalse(warnings)
+                for invalid in ("1tr36", "1tr3600", "1tr360 + 5k"):
+                    rows = source + [[invalid]]
+                    types, values, warnings = convert_columns(["Amount"], rows, [spec], ["VARCHAR"])
+                    self.assertEqual(types, ["VARCHAR"])
+                    self.assertEqual(values, rows)
+                    self.assertTrue(warnings)
+        types, values, warnings = convert_columns(["Amount"], source, [{"type": "VARCHAR"}], ["VARCHAR"])
+        self.assertEqual(types, ["VARCHAR"])
+        self.assertEqual(values, source)
         self.assertFalse(warnings)
 
     def test_money_columns_normalize_currency_suffixes(self):

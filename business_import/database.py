@@ -93,7 +93,8 @@ def load_business(conn, business, description, raw_tables, layout_by_source, loa
                         specs[i] = {"type": "VARCHAR"}
                         protected_warnings.append(f"{table['columns'][i]}: kept VARCHAR; mixed SQLite storage types")
             actual_types, values, type_warnings = convert_columns(table["columns"], table["rows"], specs, default_types,
-                                                                 excel_epoch=table.get("excel_epoch") if table["format"] == ".xlsx" else None)
+                                                                 excel_epoch=table.get("excel_epoch") if table["format"] == ".xlsx" else None,
+                                                                 sheet_name=table["source_table"] if table["format"] == ".xlsx" else None)
             type_warnings = protected_warnings + type_warnings
             proposal["actual_types"] = actual_types
             proposal["type_warnings"] = type_warnings

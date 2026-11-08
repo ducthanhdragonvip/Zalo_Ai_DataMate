@@ -1,6 +1,5 @@
 """Validate model type hints and convert whole columns without lossy casts."""
 import re
-import unicodedata
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, localcontext
 
@@ -83,9 +82,15 @@ def _convert(value, spec):
     return number
 
 
-def _date_from_formats(value, formats, excel_epoch=None):
-    if value is None:
+def _date_from_formats(value, formats, excel_epoch=None, sheet_period=None):
+    # ponytail: empty cells become NULL only for date-format conversion; other types retain strict blank checks.
+    if value is None or value == "":
         return None
+    if sheet_period and (short := re.fullmatch(r"([0-9]{1,2})/([0-9]{1,2})", str(value).strip())):
+        month, year = sheet_period
+        if int(short[2]) != month:
+            raise ValueError("short date conflicts with worksheet month")
+        return datetime(year, month, int(short[1]))
     matches = set()
     for fmt in formats:
         try:
@@ -116,6 +121,9 @@ def _vnd_amount(value):
     if value is None:
         return None
     text = str(value).strip().casefold()
+    # ponytail: embedded millions require three thousand digits; expand only with documented examples.
+    if match := re.fullmatch(r"([+-]?(?:0|[1-9][0-9]*))tr([0-9]{3})", text):
+        text = f"{match[1]}.{match[2]}tr"
     if text.endswith(("k", "tr")):
         # tr means millions; its comma is decimal (1,287tr = 1.287 million).
         millions = text.endswith("tr")
@@ -133,17 +141,17 @@ def _vnd_amount(value):
     return _convert(text, {"type": "DECIMAL", "thousands_separator": ","})
 
 
-def convert_columns(columns, rows, specs, default_types, excel_epoch=None):
+def convert_columns(columns, rows, specs, default_types, excel_epoch=None, sheet_name=None):
     """Return SQL types, converted rows and non-sensitive fallback warnings."""
     if specs is None:
         specs = [{"type": "VARCHAR"} for _ in columns]
     validate_specs(specs, len(columns))
     types, converted, warnings = list(default_types), [list(row) for row in rows], []
+    # ponytail: yearless day/month dates require an explicit T<month>_<year> worksheet period.
+    period = re.fullmatch(r"T(0?[1-9]|1[0-2])[-_]([0-9]{4})", sheet_name or "", re.IGNORECASE)
     for index, (column, spec) in enumerate(zip(columns, specs)):
-        name = "".join(c for c in unicodedata.normalize("NFD", column.casefold()) if not unicodedata.combining(c))
-        name = re.sub(r"[_\W]+", " ", name).strip()
-        if spec["type"] not in {"DATE", "TIMESTAMP"} and re.search(
-                r"\b(?:ngay|thoi gian|gio|sinh nhat|han su dung|date|datetime|timestamp|birthday|expiry|expiration|created at|updated at)\b", name):
+        sheet_period = None
+        if spec["type"] == "TIMESTAMP" and "format" not in spec and "formats" not in spec:
             # ponytail: Vietnamese dates default to day-first; add other orders only with explicit format hints.
             formats = ["%d/%m/%Y", "%d-%m-%Y", "%d thg %m %Y", "%Y-%m-%d", "%Y/%m/%d"]
             formats += ["%Y-%m-%d" + sep + "%H:%M:%S" + fraction
@@ -152,11 +160,13 @@ def convert_columns(columns, rows, specs, default_types, excel_epoch=None):
             if excel_epoch is not None:
                 formats.append("excel_serial")
             spec = {"type": "TIMESTAMP", "formats": formats}
+            if period:
+                sheet_period = (int(period[1]), int(period[2]))
         if spec["type"] == "DATE":
             spec = {**spec, "type": "TIMESTAMP"}
         if spec["type"] == "TIMESTAMP" and ("formats" in spec or spec.get("format") == "excel_serial"):
             try:
-                dates = [_date_from_formats(row[index], spec.get("formats", [spec.get("format")]), excel_epoch) for row in rows]
+                dates = [_date_from_formats(row[index], spec.get("formats", [spec.get("format")]), excel_epoch, sheet_period) for row in rows]
                 types[index] = "TIMESTAMP"
                 for row, value in zip(converted, dates):
                     row[index] = value
@@ -188,7 +198,8 @@ def convert_columns(columns, rows, specs, default_types, excel_epoch=None):
                 warnings.append(f"{column}: kept {default_types[index]}; not all values safely match timestamps")
             continue
         if spec["type"] == "DECIMAL" and (spec.get("format") == "VND" or any(
-                isinstance(row[index], str) and row[index].strip().casefold().endswith(("k", "tr", "đ", "₫"))
+                isinstance(row[index], str) and (row[index].strip().casefold().endswith(("k", "tr", "đ", "₫"))
+                                                or re.fullmatch(r"[+-]?(?:0|[1-9][0-9]*)tr[0-9]{3}", row[index].strip().casefold()))
                 for row in rows)):
             try:
                 amounts = [_vnd_amount(row[index]) for row in rows]

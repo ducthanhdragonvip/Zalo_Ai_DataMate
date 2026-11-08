@@ -22,13 +22,25 @@ def _inventory(business):
     return inventory
 
 
-def _read_tables(inventory, description):
+def _read_tables(inventory, description, defer_types=False):
+    online = "columns" in description
+    documented = {layouts.normalize_label(column["name"]) for column in description.get("columns", [])} | {
+        layouts.normalize_label(name)
+        for name in re.findall(r"\*\*([^*\n]+)\*\*", inventory.get("readme", ""))
+    }
+    if online:
+        description["tables"] = []
     descriptions = {(t["source_file"], t["source_table"]): t for t in description["tables"]}
     raw, validated_layouts = [], {}
     for file in inventory["files"]:
         for table in file["tables"]:
             key = (file["name"], table["name"])
-            proposal = descriptions[key]
+            if online:
+                proposal = {"source_file": file["name"], "source_table": table["name"],
+                            "description": "", "type_hint_warnings": []}
+                description["tables"].append(proposal)
+            else:
+                proposal = descriptions[key]
             fmt = file["format"]
             source_path = inventory["path"] / file["name"]
             if fmt == ".sqlite":
@@ -56,16 +68,92 @@ def _read_tables(inventory, description):
                     rows = [[sources._value(v) for v in row] for row in workbook[table["name"]].iter_rows(values_only=True)]
                 finally:
                     workbook.close()
-            layout = layouts.validate_layout(rows, proposal)
+            if (online and rows and len(rows[0]) >= 2
+                    and all(len(row) == len(rows[0]) and all(
+                        value in (None, "") or isinstance(value, str) and layouts._cell_kind(value) == "text"
+                        for value in row) for row in rows)
+                    and not any(layouts.normalize_label(value) in documented for row in rows for value in row)
+                    and not layouts.candidate_layout(rows, allow_preamble=True)):
+                # ponytail: unknowable all-text headers retain every row; add explicit header evidence to name columns.
+                columns = [f"column_{i}" for i in range(1, len(rows[0]) + 1)]
+                proposal["type_hint_warnings"].append(
+                    "no supported header evidence; preserved all rows with generated column names")
+                raw.append({"source_file": file["name"], "source_table": table["name"], "format": fmt,
+                            "columns": columns, "rows": [[_to_text(v, fmt) for v in row] for row in rows]})
+                continue
+            if online:
+                try:
+                    header_row = layouts.select_header(rows, documented)
+                except ValueError as exc:
+                    raise ValueError(f"{key[0]} / {key[1]}: {exc}") from exc
+                proposal.update(header_row=header_row, data_start_row=header_row + 1,
+                                columns=[{"position": i, "label": label}
+                                         for i, label in enumerate(rows[header_row - 1], 1)])
+            layout = layouts.validate_layout(rows, proposal, documented if online else None)
             validated_layouts[key] = layout
             columns = sources._unique(layout["headers"])
             header = rows[layout["header_row"] - 1]
-            values = [row for row in layout["records"] if row != header]
-            layout["repeated_header_count"] = len(layout["records"]) - len(values)
+            records = layout["records"]
+            footer_notes = []
+            # ponytail: only contiguous, explicitly labelled Excel footers; ambiguous/interior notes remain records.
+            if fmt == ".xlsx":
+                while records and isinstance(records[-1][0], str) and re.match(
+                        r"^(?:ghi chú|note)\s*:", records[-1][0].strip(), re.IGNORECASE) and all(
+                        value in (None, "") for value in records[-1][1:]):
+                    footer_notes.append({"source_row": layout["data_start_row"] + len(records) - 1,
+                                         "values": records.pop()})
+            if footer_notes:
+                proposal["footer_notes"] = list(reversed(footer_notes))
+                proposal.setdefault("type_hint_warnings", []).append(
+                    f"preserved {len(footer_notes)} trailing worksheet notes in catalog metadata, not transaction rows")
+            values = [row for row in records if row != header]
+            layout["repeated_header_count"] = len(records) - len(values)
             raw.append({"source_file": file["name"], "source_table": table["name"], "format": fmt,
                         "columns": columns, "excel_epoch": excel_epoch,
                         "rows": [[_to_text(v, fmt) for v in row] for row in values]})
+    if online and not defer_types:
+        _apply_recommendations(description, validated_layouts)
     return raw, validated_layouts
+
+
+def _apply_recommendations(description, validated_layouts):
+    recommendations, conflicts, matched = {}, set(), set()
+    for column in description["columns"]:
+        name = layouts.normalize_label(column["name"])
+        spec = {key: value for key, value in column.items() if key != "name"}
+        if name in recommendations and recommendations[name] != spec:
+            conflicts.add(name)
+        recommendations[name] = spec
+    for proposal in description["tables"]:
+        if (proposal["source_file"], proposal["source_table"]) in validated_layouts:
+            _map_recommendations(proposal, [column["label"] for column in proposal["columns"]],
+                                 recommendations, conflicts, matched)
+    if description["tables"]:
+        for column in description["columns"]:
+            if layouts.normalize_label(column["name"]) not in matched:
+                description["tables"][0]["type_hint_warnings"].append(
+                    f"unused README recommendation: {column['name']}")
+
+
+def _map_recommendations(proposal, labels, recommendations, conflicts, matched):
+    names = [layouts.normalize_label(label) for label in labels]
+    specs, warnings = [], proposal["type_hint_warnings"]
+    for label, name in zip(labels, names):
+        matched.add(name)
+        if name in conflicts:
+            specs.append({"type": "VARCHAR"})
+            warnings.append(f"{label}: conflicting README types; kept original storage")
+        elif name in recommendations:
+            specs.append(dict(recommendations[name]))
+        elif re.search(r"\b(?:ngày|ngay|thời\s+gian|thoi\s+gian|sinh\s+nhật|sinh\s+nhat|date|datetime|timestamp|birthdate|birthday)\b",
+                       name.replace("_", " ")):
+            # ponytail: keyword hints only; full-column validation decides conversion, never override explicit types.
+            specs.append({"type": "TIMESTAMP"})
+            warnings.append(f"{label}: no README recommendation; trying locally validated TIMESTAMP")
+        else:
+            specs.append({"type": "VARCHAR"})
+            warnings.append(f"{label}: no README recommendation; kept original storage")
+    proposal["column_types"] = specs
 
 
 def _read_csv_grid(path, delimiter):
@@ -150,9 +238,18 @@ def run(args):
         for business in businesses:
             try:
                 inventory = _inventory(business)
-                client = None if args.offline else llm.create_client()
-                description = _offline_description(inventory) if args.offline else llm.describe_business(client, inventory)
-                raw, layout_by_source = _read_tables(inventory, description)
+                if args.offline or all(file["format"] == ".sqlite" for file in inventory["files"]):
+                    description = _offline_description(inventory)
+                    raw, layout_by_source = _read_tables(inventory, description)
+                else:
+                    resolved = {"columns": []}
+                    raw, layout_by_source = _read_tables(inventory, resolved, defer_types=True)
+                    column_names = [column["label"] for table in resolved["tables"]
+                                    for column in table.get("columns", [])
+                                    if layouts.normalize_label(column["label"])]
+                    description = llm.describe_business(llm.create_client(), inventory, column_names)
+                    description["tables"] = resolved["tables"]
+                    _apply_recommendations(description, layout_by_source)
                 schema_name = business["id"]
                 used = set()
                 staging = [{"name": f"_stage_{i}", "columns": t["columns"], "destination": _dest(t, used)} for i, t in enumerate(raw)]
