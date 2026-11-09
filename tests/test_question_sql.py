@@ -33,6 +33,28 @@ class ContextTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_question([])
 
+    def test_context_exposes_only_bounded_status_labels(self):
+        from question_sql.context import load_context
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'fixture.duckdb'
+            fixture(path)
+            with duckdb.connect(str(path)) as conn:
+                conn.execute('ALTER TABLE biz_1.sales ADD COLUMN "Kết quả" VARCHAR')
+                conn.execute('ALTER TABLE biz_1.sales ADD COLUMN "Tên khách hàng" VARCHAR')
+                conn.execute('UPDATE biz_1.sales SET "Kết quả" = \'Xong\', "Tên khách hàng" = \'PRIVATE\'')
+                fields = load_context(conn, 'biz_1')['tables'][1]['columns']
+                self.assertEqual(fields[2]['values'], ['Xong'])
+                self.assertNotIn('values', fields[3])
+                conn.execute('ALTER TABLE biz_1.sales RENAME COLUMN "Kết quả" TO "Trạng thái đơn hàng"')
+                fields = load_context(conn, 'biz_1')['tables'][1]['columns']
+                self.assertEqual(fields[2]['values'], ['Xong'])
+                conn.execute('ALTER TABLE biz_1.sales RENAME COLUMN "Trạng thái đơn hàng" TO "Kết quả"')
+                conn.execute('DELETE FROM biz_1.sales')
+                conn.execute('INSERT INTO biz_1.sales ("Kết quả") SELECT i::VARCHAR FROM range(33) t(i)')
+                field = load_context(conn, 'biz_1')['tables'][1]['columns'][2]
+                self.assertNotIn('values', field)
+                self.assertTrue(field['values_omitted'])
+
     def test_context_contains_all_actual_columns_and_provenance(self):
         from question_sql.context import load_context
         with tempfile.TemporaryDirectory() as temp:
@@ -77,6 +99,11 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(payload['context'], context)
         self.assertEqual(payload['database_schema'], 'CREATE TABLE "biz_1"."sales" (\n  "Ngày" DATE,\n  "Tiền" DECIMAL(18,2)\n);\n\nCREATE TABLE "biz_1"."products" (\n  "Mã" VARCHAR\n);')
         self.assertEqual(payload['as_of_date'], '2026-09-07')
+        self.assertEqual(payload['date_boundaries'], {
+            'yesterday': {'start': '2026-09-06', 'exclusive_end': '2026-09-07'},
+            'last_week': {'start': '2026-08-31', 'exclusive_end': '2026-09-07'},
+            'as_of_exclusive_end': '2026-09-08',
+        })
         self.assertEqual(payload['question'], QUESTION['question'])
         for content in ('', '{}', '{"type":"number","sql":null}', '{"type":"unanswerable","sql":"SELECT 1"}', 'not json'):
             client.chat.completions.create = lambda **kw: SimpleNamespace(choices=[SimpleNamespace(finish_reason='stop', message=SimpleNamespace(content=content))])

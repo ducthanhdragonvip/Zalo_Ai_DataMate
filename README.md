@@ -120,7 +120,7 @@ Use the actual destination table names from the database; file and sheet names a
 
 ## Generate SQL and answer questions
 
-The separate `question_sql` package reads the actual `questions.jsonl` files. Each valid question makes **one model request**, using its `business_id` schema, question, `as_of_date`, the complete imported README snapshot, every actual column/type, source file/sheet mappings, and import warnings. It does not send source records or use training answers as input. This context is sent to the endpoint configured by `MODEL_API_KEY`, `MODEL_BASE_URL`, and `MODEL_NAME`, using the importer's defaults when overrides are absent.
+The separate `question_sql` package reads the actual `questions.jsonl` files. Each valid question makes **one model request**, using its `business_id` schema, question, `as_of_date`, the complete imported README snapshot, every actual column/type, source file/sheet mappings, and import warnings. It also sends Python-computed yesterday/previous-week date boundaries and distinct labels from allowlisted text order-status columns (at most 32 labels, each at most 128 characters; larger sets are omitted rather than truncated). No transaction rows, customer fields, or training answers are sent as input. Status meanings still require model interpretation; SQL validity is not proof of answer accuracy. This context is sent to the endpoint configured by `MODEL_API_KEY`, `MODEL_BASE_URL`, and `MODEL_NAME`, using the importer's defaults when overrides are absent.
 
 ```powershell
 python -m question_sql --questions data/train/questions.jsonl --output tmp/train_answers.jsonl --limit 5

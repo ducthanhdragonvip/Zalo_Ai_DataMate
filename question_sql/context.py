@@ -3,6 +3,9 @@
 import json
 import re
 from datetime import date
+import unicodedata
+
+from business_import.sql import quote_identifier
 
 
 def validate_question(record):
@@ -37,5 +40,23 @@ def load_context(conn, business_id):
         fields = [{'name': column, 'type': kind} for table, column, kind in columns if table == name]
         if not fields:
             raise ValueError(f'{business_id}.{name}: missing columns')
+        for field in fields:
+            normalized = ''.join(c for c in unicodedata.normalize('NFD', field['name'].casefold()) if not unicodedata.combining(c))
+            normalized = ' '.join(normalized.replace('đ', 'd').replace('_', ' ').split())
+            if field['type'] != 'VARCHAR' or normalized not in {
+                'ket qua', 'trang thai', 'trang thai don hang', 'trang thai xu ly',
+                'status', 'order status',
+            }:
+                continue
+            column = quote_identifier(field['name'])
+            # ponytail: only small status enums; extend the allowlist for documented status columns.
+            values = conn.execute(
+                f'SELECT DISTINCT {column} FROM {quote_identifier(business_id)}.{quote_identifier(name)} '
+                f'WHERE {column} IS NOT NULL ORDER BY 1 LIMIT 33'
+            ).fetchall()
+            if len(values) > 32 or any(len(v[0]) > 128 for v in values):
+                field['values_omitted'] = True
+            else:
+                field['values'] = [v[0] for v in values]
         tables.append({'name': name, 'source_file': source_file, 'source_table': source_table, 'columns': fields})
     return {'business_id': business_id, 'readme': business[0], 'warnings': business[2], 'tables': tables}
