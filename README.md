@@ -118,6 +118,24 @@ conn.close()
 
 Use the actual destination table names from the database; file and sheet names are normalized for SQL and collisions receive suffixes.
 
+## Profile imported business data
+
+Run the separate, offline `business_profile` tool **after importing**:
+
+```powershell
+python -m business_profile --business biz_101
+python -m business_profile
+python -m business_profile --db tmp/businesses.duckdb --output-dir tmp/profiles
+```
+
+The default database is `tmp/businesses.duckdb`. The default output folder is `<database parent>/business_profiles/`, with one readable UTF-8 JSON file per business, such as `tmp/business_profiles/biz_101.json`. Without `--business`, all loaded catalog businesses are profiled. The database is opened read-only; no model or source-file access is needed. `--timeout` defaults to 60 seconds of query work per business; this is not a memory bound or OS sandbox. Close DBeaver/other connections if DuckDB reports a file lock.
+
+JSON contains only `business_id` and `tables`. Tables with identical ordered column names and types share one combined profile: `names` lists the member tables, and column counts and category domains are computed across their combined rows using `UNION ALL`. Distinct counts are recomputed, not summed; overlapping rows are not deduplicated. Single-table profiles retain `name`. Column definitions/statistics appear only once per group. Supported scalar columns include distinct counts (excluding NULL). Floating NaN/infinities are reported via `nonfinite_count`. Unsupported types have an omission reason. No `row_count`, `null_count`, `empty_string_count`, `min`, `max`, `profile_version`, `source`, timestamps, README copies or sample rows are added.
+
+Only allowlisted status/category/unit/payment text fields expose complete distinct `values`: at most 32 labels, each at most 128 characters. Larger domains are entirely omitted with `values_omitted`, not truncated. Identifier/contact/birth-date values and arbitrary text examples are excluded. Name-based rules are **not a PII detector**; misleading column names can still expose sensitive data, so review JSON before sharing it.
+
+Reruns atomically replace matching business-profile JSON files, refuse unrelated files/symlink outputs, and preserve the previous file if generation or publication fails. Errors are reported per business; the batch continues and exits nonzero if any fail. Use a separate output directory for each database: JSON intentionally has no source identity or freshness metadata. **Rerun after reimport or manual data changes.** Profiling is manual, and SQL generation does not consume these files yet.
+
 ## Generate SQL and answer questions
 
 The separate `question_sql` package reads the actual `questions.jsonl` files. Each valid question makes **one model request**, using its `business_id` schema, question, `as_of_date`, the complete imported README snapshot, every actual column/type, source file/sheet mappings, and import warnings. It also sends Python-computed yesterday/previous-week date boundaries and distinct labels from allowlisted text order-status columns (at most 32 labels, each at most 128 characters; larger sets are omitted rather than truncated). No transaction rows, customer fields, or training answers are sent as input. Status meanings still require model interpretation; SQL validity is not proof of answer accuracy. This context is sent to the endpoint configured by `MODEL_API_KEY`, `MODEL_BASE_URL`, and `MODEL_NAME`, using the importer's defaults when overrides are absent.
