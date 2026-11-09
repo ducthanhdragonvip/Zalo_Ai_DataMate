@@ -20,6 +20,28 @@ class ColumnTypeTests(unittest.TestCase):
         load_business(conn, {"id": "biz_1", "split": "train"}, description, raw, {}, plan)
         return conn
 
+    def test_decimal_count_units_are_removed_only_for_safe_quantities(self):
+        rows = [['1 phần'], ['2 cái'], ['1.5 customunit'], ['3'], [''], [None]]
+        conn = self.load(rows, [{'type': 'DECIMAL'}])
+        self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(),
+                         [(1,), (2,), (Decimal('1.5'),), (3,), (None,), (None,)])
+        for bad in ['2 cái + 1 ly', '01 ly', '1 kg/m', '1 ly 2', '1 ly -2', '1 ly = 2']:
+            source = [['1 ly'], [bad]]
+            conn = self.load(source, [{'type': 'DECIMAL'}])
+            self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [tuple(row) for row in source])
+        conn = self.load([['1 ly']], [{'type': 'VARCHAR'}])
+        self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [('1 ly',)])
+        conn = self.load([['1,5 LY']], [{'type': 'DECIMAL', 'decimal_separator': ','}])
+        self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [(Decimal('1.5'),)])
+
+    def test_decimal_compound_units_keep_leading_quantity_without_scaling(self):
+        rows = [['3 bình'], ['1 xe 4m3'], ['20 bình'], ['1 m3'], ['2 cuộn 10m'],
+                ['1 cuộn 4x50m'], ['-11 m3'], ['1 unit2'], ['1 two words'], ['174 000 bình']]
+        conn = self.load(rows, [{'type': 'DECIMAL'}])
+        self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(),
+                         [(3,), (1,), (20,), (1,), (2,), (1,), (-11,), (1,), (1,), (174000,)])
+        self.assertEqual(conn.execute('DESCRIBE biz_1.sales').fetchone()[1], 'DECIMAL(38,10)')
+
     def test_only_final_timestamp_outlier_is_excluded_without_label_rules(self):
         for label in ['Tổng cộng', 'arbitrary footer']:
             conn = self.load([['04/02/2025'], ['05/02/2025'], [label]], [{'type': 'TIMESTAMP'}])

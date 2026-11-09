@@ -43,6 +43,11 @@ def _convert(value, spec):
         raise ValueError("unsupported source value")
     text = str(value).strip()
     kind = spec["type"]
+    # ponytail: alphanumeric unit tokens only; keep the leading quantity, never scale or evaluate expressions.
+    if kind == "DECIMAL" and spec.get("format") != "VND":
+        unit = re.fullmatch(r"(.+?) +([^\W\d_][^\W_]*(?: +[^\W_]+)*)", text)
+        if unit and all(any(char.isalpha() for char in token) for token in unit[2].split()):
+            text = unit[1]
     if kind in ("DATE", "TIMESTAMP"):
         fmt = spec.get("format")
         # Exact aliases only: do not infer day/month order from ambiguous values.

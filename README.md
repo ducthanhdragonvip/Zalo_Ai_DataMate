@@ -118,6 +118,33 @@ conn.close()
 
 Use the actual destination table names from the database; file and sheet names are normalized for SQL and collisions receive suffixes.
 
+## Generate SQL and answer questions
+
+The separate `question_sql` package reads the actual `questions.jsonl` files. Each valid question makes **one model request**, using its `business_id` schema, question, `as_of_date`, the complete imported README snapshot, every actual column/type, source file/sheet mappings, and import warnings. It does not send source records or use training answers as input. This context is sent to the endpoint configured by `MODEL_API_KEY`, `MODEL_BASE_URL`, and `MODEL_NAME`, using the importer's defaults when overrides are absent.
+
+```powershell
+python -m question_sql --questions data/train/questions.jsonl --output tmp/train_answers.jsonl --limit 5
+python -m question_sql --questions data/public_test/questions.jsonl --output tmp/public_answers.jsonl
+```
+
+The default DB is `tmp/businesses.duckdb`; override with `--db`. Close DBeaver's database connection before running if DuckDB reports a file lock. Both output paths must be new; existing files are never overwritten.
+
+Answers contain `id`, `type`, and `answer`, without `alias`. `unanswerable` and `abstain` contain only `id` and `type`:
+
+```json
+{"id":"q_001883280e83","type":"number","answer":89526400}
+{"id":"q_example_missing","type":"unanswerable"}
+{"id":"q_example_uncertain","type":"abstain"}
+```
+
+Supported types: `number`, `percent` (percentage points), `string`, `boolean`, `date` (`YYYY-MM-DD`), `list`, `table` (`{"columns": [...], "rows": [...]}`), `unanswerable` (required data unavailable), and `abstain` (model cannot confidently determine a correct query). The last two skip SQL execution. Numeric answers remain JSON numbers, including exact decimals. The same request selects the answer type and SQL; Python formats the executed results without another model call.
+
+SQL, raw result rows, original questions, and stage-specific errors are saved separately to `<output stem>.details.jsonl`; override with `--details`. This diagnostics file can contain business data, so handle it accordingly. Failed questions are recorded there and omitted from the answers file, not disguised as `unanswerable`. The batch continues and exits nonzero if any question fails. Model failures are not retried or repaired; `--limit` caps input lines.
+
+SQL runs in a spawned worker containing an in-memory copy of only the requested business's tables. The original DB is read-only and detached before model SQL runs. Exactly one SELECT/CTE is allowed; external access, extension autoload/install, and disk spilling are disabled, and configuration is locked. This is defense in depth, **not a hardened OS sandbox**. Default limits: `--timeout 60` seconds including copying, `--max-rows 10000`, 256 MiB DuckDB memory, and 16 MiB result payload. Limits fail explicitly, never silently truncate. Large businesses may exceed copy/memory limits; DuckDB's memory setting does not bound all Python allocations.
+
+Review generated SQL before relying on answers: successful execution does not prove correct joins, date cutoffs, units, or aggregation. Relative dates use `as_of_date`, not the current machine date. Run `python -m question_sql --help` for options.
+
 ## Run tests
 
 ```powershell
