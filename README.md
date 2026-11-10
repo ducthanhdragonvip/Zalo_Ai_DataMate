@@ -134,30 +134,41 @@ JSON contains only `business_id` and `tables`. Tables with identical ordered col
 
 Only allowlisted status/category/unit/payment text fields expose complete distinct `values`: at most 32 labels, each at most 128 characters. Larger domains are entirely omitted with `values_omitted`, not truncated. Identifier/contact/birth-date values and arbitrary text examples are excluded. Name-based rules are **not a PII detector**; misleading column names can still expose sensitive data, so review JSON before sharing it.
 
-Reruns atomically replace matching business-profile JSON files, refuse unrelated files/symlink outputs, and preserve the previous file if generation or publication fails. Errors are reported per business; the batch continues and exits nonzero if any fail. Use a separate output directory for each database: JSON intentionally has no source identity or freshness metadata. **Rerun after reimport or manual data changes.** Profiling is manual, and SQL generation does not consume these files yet.
+Reruns atomically replace matching business-profile JSON files, refuse unrelated files/symlink outputs, and preserve the previous file if generation or publication fails. Errors are reported per business; the batch continues and exits nonzero if any fail. Use a separate output directory for each database: JSON intentionally has no source identity or freshness metadata. **Rerun after reimport or manual data changes.** Profiling is manual; `question_sql` requires these saved files as described below.
 
 ## Generate SQL and answer questions
 
-The separate `question_sql` package reads the actual `questions.jsonl` files. Each valid question makes **one model request**, using its `business_id` schema, question, `as_of_date`, the complete imported README snapshot, every actual column/type, source file/sheet mappings, and import warnings. It also sends Python-computed yesterday/previous-week date boundaries and distinct labels from allowlisted text order-status columns (at most 32 labels, each at most 128 characters; larger sets are omitted rather than truncated). No transaction rows, customer fields, or training answers are sent as input. Status meanings still require model interpretation; SQL validity is not proof of answer accuracy. This context is sent to the endpoint configured by `MODEL_API_KEY`, `MODEL_BASE_URL`, and `MODEL_NAME`, using the importer's defaults when overrides are absent.
+The separate `question_sql` package reads `questions.jsonl`. First generate profiles for the imported businesses. Each question with valid context makes **one model request** with a flat JSON payload: `question`, `business_id`, `as_of_date`, Python-computed `date_boundaries`, the complete imported `readme`, saved `business_profile`, `sources` mappings, and import `warnings`. The profile is the single schema representation; no duplicate DDL or live status-label queries are added. Grouped `names` represent separate tables with statistics/domains over their combined `UNION ALL`, not joins or per-table label guarantees.
+
+The **full validated saved profile**, including actual bounded category labels, plus README/source mappings/warnings goes to the configured endpoint (`MODEL_API_KEY`, `MODEL_BASE_URL`, `MODEL_NAME`, with importer defaults). No transaction samples or training answers are added. Review this input before sharing: README and labels can be sensitive, and the profiler's name-based exclusions are not guaranteed PII detection. Category coverage still uses the profiler's existing allowlist; this integration does not discover semantics for arbitrary column names. README/status interpretation remains the model's job; valid SQL is not proof of accurate answers.
 
 ```powershell
-python -m question_sql --questions data/train/questions.jsonl --output tmp/train_answers.jsonl --limit 5
+python -m business_profile --business biz_101
+python -m question_sql --questions data/train/questions.jsonl --output tmp/profile_answers.jsonl --limit 5
+
+# Generate all loaded profiles when questions cover multiple businesses:
+python -m business_profile
 python -m question_sql --questions data/public_test/questions.jsonl --output tmp/public_answers.jsonl
+
+python -m business_profile --db tmp/custom.duckdb --output-dir tmp/custom_profiles
+python -m question_sql --db tmp/custom.duckdb --profile-dir tmp/custom_profiles --questions data/train/questions.jsonl --output tmp/custom_answers.jsonl --limit 5
 ```
 
-The default DB is `tmp/businesses.duckdb`; override with `--db`. Close DBeaver's database connection before running if DuckDB reports a file lock. Both output paths must be new; existing files are never overwritten.
+The default DB is `tmp/businesses.duckdb`; override with `--db`. Profiles default to `<resolved database parent>/business_profiles`; override with `--profile-dir`. Each requested business needs `<business_id>.json` matching all actual tables and ordered column names/types. Missing, invalid, legacy-extra-field or schema-mismatched profiles fail at the context stage **before model access**, with a regeneration command; later questions continue. QA never generates profiles automatically.
 
-Answers contain `id`, `type`, and `answer`, without `alias`. `unanswerable` and `abstain` contain only `id` and `type`:
+**Rerun profiling after reimport or data changes and use separate profile directories per database.** Schema matching cannot detect stale statistics or a different database with the same schema: the format contains no freshness/source identity. Close DBeaver's database connection if DuckDB reports a lock. Both output paths must be new; existing files are never overwritten.
+
+Successful answers contain `id`, `type`, and `answer`, without `alias`. Model `unanswerable`/`abstain` and failed questions with a valid ID are emitted as `unanswerable` with a `reason`:
 
 ```json
 {"id":"q_001883280e83","type":"number","answer":89526400}
-{"id":"q_example_missing","type":"unanswerable"}
-{"id":"q_example_uncertain","type":"abstain"}
+{"id":"q_example_missing","type":"unanswerable","reason":"Required data is unavailable."}
+{"id":"q_example_uncertain","type":"unanswerable","reason":"Cannot determine a reliable answer."}
 ```
 
 Supported types: `number`, `percent` (percentage points), `string`, `boolean`, `date` (`YYYY-MM-DD`), `list`, `table` (`{"columns": [...], "rows": [...]}`), `unanswerable` (required data unavailable), and `abstain` (model cannot confidently determine a correct query). The last two skip SQL execution. Numeric answers remain JSON numbers, including exact decimals. The same request selects the answer type and SQL; Python formats the executed results without another model call.
 
-SQL, raw result rows, original questions, and stage-specific errors are saved separately to `<output stem>.details.jsonl`; override with `--details`. This diagnostics file can contain business data, so handle it accordingly. Failed questions are recorded there and omitted from the answers file, not disguised as `unanswerable`. The batch continues and exits nonzero if any question fails. Model failures are not retried or repaired; `--limit` caps input lines.
+SQL, raw result rows, original questions, and stage-specific errors are saved separately to `<output stem>.details.jsonl`; override with `--details`. This diagnostics file can contain business data, so handle it accordingly. Failed questions with a valid nonempty Unicode ID also get an `unanswerable` answer with a stage-specific reason directing readers to details; malformed input without a usable ID remains details-only. Details retain the original error/status, so operational failures remain distinguishable from model nonanswers. The batch continues and exits nonzero if any question fails. Model failures are not retried or repaired; `--limit` caps input lines.
 
 SQL runs in a spawned worker containing an in-memory copy of only the requested business's tables. The original DB is read-only and detached before model SQL runs. Exactly one SELECT/CTE is allowed; external access, extension autoload/install, and disk spilling are disabled, and configuration is locked. This is defense in depth, **not a hardened OS sandbox**. Default limits: `--timeout 60` seconds including copying, `--max-rows 10000`, 256 MiB DuckDB memory, and 16 MiB result payload. Limits fail explicitly, never silently truncate. Large businesses may exceed copy/memory limits; DuckDB's memory setting does not bound all Python allocations.
 

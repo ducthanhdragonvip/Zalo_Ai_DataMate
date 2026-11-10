@@ -4,7 +4,7 @@ import json
 import math
 import re
 from datetime import date, datetime, time
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 
 
 MAX_PAYLOAD = 16 * 1024 * 1024
@@ -28,7 +28,8 @@ def dumps(value):
 def format_answer(question_id, generation, columns, rows):
     kind = generation['type']
     if kind in ('unanswerable', 'abstain'):
-        return {'id': question_id, 'type': kind}
+        reason = 'Required data is unavailable.' if kind == 'unanswerable' else 'Cannot determine a reliable answer.'
+        return {'id': question_id, 'type': 'unanswerable', 'reason': reason}
     if kind == 'table':
         answer = {'columns': columns, 'rows': rows}
     elif kind == 'list':
@@ -39,9 +40,20 @@ def format_answer(question_id, generation, columns, rows):
         if len(columns) != 1 or len(rows) != 1 or len(rows[0]) != 1:
             raise ValueError('scalar answer requires one row and column')
         answer = rows[0][0]
+        if kind in ('string', 'date') and isinstance(answer, datetime):
+            kind, answer = 'date', answer.date().isoformat()
         if kind in ('number', 'percent'):
             if isinstance(answer, bool) or not isinstance(answer, (int, float, Decimal)):
                 raise ValueError('numeric answer required')
+            numeric = answer if isinstance(answer, Decimal) else Decimal(str(answer))
+            if not numeric.is_finite():
+                raise ValueError('finite numeric answer required')
+            if kind == 'number':
+                answer = int(numeric.to_integral_value(rounding=ROUND_HALF_UP))
+            else:
+                with localcontext() as context:
+                    context.prec = max(context.prec, numeric.adjusted() + 4)
+                    answer = numeric.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         elif kind == 'boolean':
             if not isinstance(answer, bool):
                 raise ValueError('boolean answer required')
@@ -56,8 +68,10 @@ def format_answer(question_id, generation, columns, rows):
             date.fromisoformat(answer)
         else:
             raise ValueError('unsupported answer type')
-    # Native dates in tables/lists are still calendar strings, not arbitrary repr().
+    # Answer timestamps use their returned calendar date; diagnostics retain the full value.
     def dates(value):
+        if isinstance(value, datetime):
+            return value.date().isoformat()
         if isinstance(value, (date, time)):
             return value.isoformat()
         if isinstance(value, (list, tuple)):

@@ -1,11 +1,11 @@
-"""Question validation and imported business metadata."""
+"""Question validation and required profile-backed business context."""
 
 import json
 import re
 from datetime import date
-import unicodedata
+from pathlib import Path
 
-from business_import.sql import quote_identifier
+from business_profile.profiling import NUMERIC, TEMPORAL
 
 
 def validate_question(record):
@@ -26,7 +26,71 @@ def validate_question(record):
     return record
 
 
-def load_context(conn, business_id):
+def _load_profile(profile_dir, business_id, actual_columns):
+    """Validate the current profiler contract before sending any saved fields."""
+    def require(condition):
+        if not condition:
+            raise ValueError('invalid or schema-mismatched profile')
+
+    def name(value):
+        return isinstance(value, str) and bool(value.strip()) and '\x00' not in value
+
+    try:
+        profile = json.loads((Path(profile_dir) / f'{business_id}.json').read_text(encoding='utf-8'))
+        json.dumps(profile, ensure_ascii=False, allow_nan=False).encode('utf-8')
+        require(isinstance(profile, dict) and set(profile) == {'business_id', 'tables'})
+        require(profile['business_id'] == business_id and isinstance(profile['tables'], list))
+        expanded = {}
+        for table in profile['tables']:
+            require(isinstance(table, dict) and set(table) in ({'name', 'columns'}, {'names', 'columns'}))
+            names = [table['name']] if 'name' in table else table['names']
+            require(isinstance(names, list) and bool(names) and all(name(n) for n in names))
+            require(len(names) == len(set(names)) and not set(names).intersection(expanded))
+            require(isinstance(table['columns'], list) and bool(table['columns']))
+            signature = []
+            for field in table['columns']:
+                require(isinstance(field, dict) and {'name', 'type'} <= field.keys())
+                require(name(field['name']) and name(field['type']))
+                kind = field['type']
+                supported = kind in NUMERIC | TEMPORAL | {'VARCHAR', 'BOOLEAN', 'UUID', 'TIME', 'TIME WITH TIME ZONE'} or kind.startswith('DECIMAL(')
+                required = {'name', 'type', 'distinct_count'} if supported else {'name', 'type', 'stats_omitted'}
+                if kind in {'FLOAT', 'DOUBLE'}:
+                    required.add('nonfinite_count')
+                optional = {'values', 'values_omitted'} if kind == 'VARCHAR' else set()
+                require(required <= field.keys() <= required | optional)
+                for key in ('distinct_count', 'nonfinite_count'):
+                    if key in field:
+                        require(type(field[key]) is int and field[key] >= 0)
+                if not supported:
+                    require(field['stats_omitted'] == 'unsupported type')
+                require(not {'values', 'values_omitted'} <= field.keys())
+                if 'values' in field:
+                    values = field['values']
+                    require(isinstance(values, list) and len(values) <= 32)
+                    require(all(isinstance(v, str) and len(v) <= 128 for v in values))
+                    require(len(values) == len(set(values)) == field['distinct_count'])
+                if 'values_omitted' in field:
+                    require(field['values_omitted'] in ('more than 32 labels', 'label exceeds 128 characters'))
+                signature.append((field['name'], kind))
+            require(len(signature) == len({column for column, _ in signature}))
+            for table_name in names:
+                expanded[table_name] = signature
+        expected = {}
+        for table_name, column, kind in actual_columns:
+            expected.setdefault(table_name, []).append((column, kind))
+        require(expanded == expected)
+        return profile
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise ValueError(
+            f'{business_id}: missing, invalid or schema-mismatched business_profile JSON; '
+            f'regenerate with python -m business_profile --business {business_id} '
+            f'--output-dir "{profile_dir}" (use the same --db as question_sql)'
+        ) from exc
+
+
+def load_catalog(conn, business_id):
+    if not isinstance(business_id, str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', business_id):
+        raise ValueError('invalid business schema')
     business = conn.execute('SELECT readme, import_status, warnings FROM _catalog.businesses WHERE business_id=?', [business_id]).fetchone()
     if not business or business[1] != 'loaded' or not business[0] or not business[0].strip():
         raise ValueError(f'{business_id}: missing loaded business or README')
@@ -35,28 +99,13 @@ def load_context(conn, business_id):
     if not mappings or {m[0] for m in mappings} != {t[0] for t in actual} or len(mappings) != len(actual) or any(t[1] != 'BASE TABLE' for t in actual):
         raise ValueError(f'{business_id}: inconsistent catalog tables or unsupported views')
     columns = conn.execute('SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema=? ORDER BY table_name, ordinal_position', [business_id]).fetchall()
-    tables = []
-    for name, source_file, source_table in mappings:
-        fields = [{'name': column, 'type': kind} for table, column, kind in columns if table == name]
-        if not fields:
-            raise ValueError(f'{business_id}.{name}: missing columns')
-        for field in fields:
-            normalized = ''.join(c for c in unicodedata.normalize('NFD', field['name'].casefold()) if not unicodedata.combining(c))
-            normalized = ' '.join(normalized.replace('đ', 'd').replace('_', ' ').split())
-            if field['type'] != 'VARCHAR' or normalized not in {
-                'ket qua', 'trang thai', 'trang thai don hang', 'trang thai xu ly',
-                'status', 'order status',
-            }:
-                continue
-            column = quote_identifier(field['name'])
-            # ponytail: only small status enums; extend the allowlist for documented status columns.
-            values = conn.execute(
-                f'SELECT DISTINCT {column} FROM {quote_identifier(business_id)}.{quote_identifier(name)} '
-                f'WHERE {column} IS NOT NULL ORDER BY 1 LIMIT 33'
-            ).fetchall()
-            if len(values) > 32 or any(len(v[0]) > 128 for v in values):
-                field['values_omitted'] = True
-            else:
-                field['values'] = [v[0] for v in values]
-        tables.append({'name': name, 'source_file': source_file, 'source_table': source_table, 'columns': fields})
-    return {'business_id': business_id, 'readme': business[0], 'warnings': business[2], 'tables': tables}
+    if {table for table, _, _ in columns} != {table for table, _ in actual}:
+        raise ValueError(f'{business_id}: missing columns')
+    sources = [{'name': name, 'source_file': source_file, 'source_table': source_table} for name, source_file, source_table in mappings]
+    return {'business_id': business_id, 'readme': business[0], 'warnings': business[2], 'sources': sources}, columns
+
+
+def load_context(conn, business_id, profile_dir):
+    context, columns = load_catalog(conn, business_id)
+    context['business_profile'] = _load_profile(profile_dir, business_id, columns)
+    return context

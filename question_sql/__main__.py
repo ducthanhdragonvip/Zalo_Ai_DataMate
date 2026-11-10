@@ -26,12 +26,13 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--details', type=Path, help='SQL/results/errors JSONL; defaults to <output stem>.details.jsonl')
     parser.add_argument('--db', type=Path, default=Path(__file__).resolve().parent.parent / 'tmp' / 'businesses.duckdb')
+    parser.add_argument('--profile-dir', type=Path, help='required business JSON profiles (default: <database parent>/business_profiles)')
     parser.add_argument('--limit', type=positive_int, help='maximum input lines')
     parser.add_argument('--timeout', type=positive_seconds, default=60, help='worker deadline in seconds (default: 60)')
     parser.add_argument('--max-rows', type=positive_int, default=10000, help='result row limit (default: 10000)')
     args = parser.parse_args()
     try:
-        return run(args.questions, args.output, args.db, details_path=args.details, limit=args.limit, timeout=args.timeout, max_rows=args.max_rows)
+        return run(args.questions, args.output, args.db, profile_dir=args.profile_dir, details_path=args.details, limit=args.limit, timeout=args.timeout, max_rows=args.max_rows)
     except (OSError, ValueError) as exc:
         print(f'question_sql: {exc}', file=sys.stderr)
         return 1

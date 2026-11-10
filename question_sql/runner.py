@@ -13,10 +13,11 @@ from .execution import execute_sql
 from .llm import generate_sql
 
 
-def run(input_path, output_path, db_path, *, details_path=None, limit=None, timeout=60, max_rows=10000):
+def run(input_path, output_path, db_path, *, profile_dir=None, details_path=None, limit=None, timeout=60, max_rows=10000):
     if (limit is not None and limit <= 0) or timeout <= 0 or max_rows <= 0:
         raise ValueError('limits must be positive')
     input_path, output_path, db_path = (Path(path).resolve() for path in (input_path, output_path, db_path))
+    profile_dir = Path(profile_dir).resolve() if profile_dir is not None else db_path.parent / 'business_profiles'
     details_path = Path(details_path).resolve() if details_path else output_path.with_name(output_path.stem + '.details.jsonl')
     paths = [input_path, output_path, db_path, details_path]
     if len(set(os.path.normcase(str(path)) for path in paths)) != len(paths):
@@ -48,7 +49,7 @@ def run(input_path, output_path, db_path, *, details_path=None, limit=None, time
                     stage = 'context'
                     business_id = record['business_id']
                     if business_id not in contexts:
-                        contexts[business_id] = load_context(conn, business_id)
+                        contexts[business_id] = load_context(conn, business_id, profile_dir)
                     stage = 'model'
                     if client is None:
                         client = create_client().with_options(max_retries=0)
@@ -72,6 +73,11 @@ def run(input_path, output_path, db_path, *, details_path=None, limit=None, time
                     answer = None
                     info.update(rows=[], status='error', error={'stage': 'serialization', 'message': 'details exceed 16 MiB payload limit'})
                     detail_line = dumps(diagnostic(info))
+                if answer is None and isinstance(info['input'], dict):
+                    question_id = info['input'].get('id')
+                    if isinstance(question_id, str) and question_id.strip() and diagnostic(question_id) == question_id:
+                        answer = {'id': question_id, 'type': 'unanswerable',
+                                  'reason': f"{info['error']['stage']}: unable to produce a valid answer; see details."}
                 details.write(detail_line + '\n')
                 details.flush()
                 if answer is not None:

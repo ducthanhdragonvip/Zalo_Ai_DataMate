@@ -25,7 +25,7 @@ class ColumnTypeTests(unittest.TestCase):
         conn = self.load(rows, [{'type': 'DECIMAL'}])
         self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(),
                          [(1,), (2,), (Decimal('1.5'),), (3,), (None,), (None,)])
-        for bad in ['2 cái + 1 ly', '01 ly', '1 kg/m', '1 ly 2', '1 ly -2', '1 ly = 2']:
+        for bad in ['2 cái + 1 ly', '01 ly', '1 kg/m', '1 ly -2', '1 ly = 2']:
             source = [['1 ly'], [bad]]
             conn = self.load(source, [{'type': 'DECIMAL'}])
             self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [tuple(row) for row in source])
@@ -40,6 +40,11 @@ class ColumnTypeTests(unittest.TestCase):
         conn = self.load(rows, [{'type': 'DECIMAL'}])
         self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(),
                          [(3,), (1,), (20,), (1,), (2,), (1,), (-11,), (1,), (1,), (174000,)])
+        self.assertEqual(conn.execute('DESCRIBE biz_1.sales').fetchone()[1], 'DECIMAL(38,10)')
+
+    def test_decimal_unit_description_can_include_standalone_package_size(self):
+        conn = self.load([['1 hộp 30'], ['2 hộp 30'], ['3 customunit 50']], [{'type': 'DECIMAL'}])
+        self.assertEqual(conn.execute('SELECT * FROM biz_1.sales').fetchall(), [(1,), (2,), (3,)])
         self.assertEqual(conn.execute('DESCRIBE biz_1.sales').fetchone()[1], 'DECIMAL(38,10)')
 
     def test_only_final_timestamp_outlier_is_excluded_without_label_rules(self):

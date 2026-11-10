@@ -46,7 +46,7 @@ def _convert(value, spec):
     # ponytail: alphanumeric unit tokens only; keep the leading quantity, never scale or evaluate expressions.
     if kind == "DECIMAL" and spec.get("format") != "VND":
         unit = re.fullmatch(r"(.+?) +([^\W\d_][^\W_]*(?: +[^\W_]+)*)", text)
-        if unit and all(any(char.isalpha() for char in token) for token in unit[2].split()):
+        if unit:
             text = unit[1]
     if kind in ("DATE", "TIMESTAMP"):
         fmt = spec.get("format")

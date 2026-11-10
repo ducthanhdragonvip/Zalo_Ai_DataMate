@@ -36,9 +36,10 @@ Add `--offline` to skip the LLM call; offline imports only locally unambiguous f
 python -m business_import --business biz_101 --offline
 ```
 
-Generate answers from an already-imported database (output and details paths must not exist):
+Generate profiles, then answers from an already-imported database (output and details paths must not exist):
 
 ```powershell
+python -m business_profile
 python -m question_sql --questions data/train/questions.jsonl --output tmp/train_answers.jsonl --limit 5
 python -m question_sql --help
 ```
@@ -63,15 +64,17 @@ Preambles and excluded source rows are tracked in metadata rather than silently 
 
 Run `python -m business_profile --business biz_101` after import, or omit `--business` for all loaded businesses. It opens `--db` read-only (default `tmp/businesses.duckdb`) and writes one JSON per business under `--output-dir` (default `<database parent>/business_profiles/`). `--timeout` defaults to 60 seconds per business. Tests: `python -m unittest discover -s tests -p "test_business_profile.py" -v`.
 
-`business_profile/profiling.py` validates catalog-owned tables, computes final-table column counts and bounded allowlisted category domains, and atomically replaces matching JSON outputs. JSON contains only business ID/table/column facts, no `row_count`, `null_count`, `empty_string_count`, `min`, `max`, source/version/timestamps or sample rows. Tables with identical ordered column names/types share one profile with `names` and exact aggregate statistics across `UNION ALL` rows; singleton profiles retain `name`. Combined distinct counts are recomputed, not summed; duplicate rows remain. Category domains are complete or explicitly omitted (32 values, 128 characters). Identifier/contact/birth-date values are excluded by name-based rules, not guaranteed PII detection. Rerun after data changes and keep output directories separate per database: no freshness/source identity is stored. No model calls, importer hooks, catalog writes or QA integration.
+`business_profile/profiling.py` validates catalog-owned tables, computes final-table column counts and bounded allowlisted category domains, and atomically replaces matching JSON outputs. JSON contains only business ID/table/column facts, no `row_count`, `null_count`, `empty_string_count`, `min`, `max`, source/version/timestamps or sample rows. Tables with identical ordered column names/types share one profile with `names` and exact aggregate statistics across `UNION ALL` rows; singleton profiles retain `name`. Combined distinct counts are recomputed, not summed; duplicate rows remain. Category domains are complete or explicitly omitted (32 values, 128 characters). Identifier/contact/birth-date values are excluded by name-based rules, not guaranteed PII detection. Rerun after data changes and keep output directories separate per database: no freshness/source identity is stored. No model calls, importer hooks or catalog writes. QA consumes these JSON files but does not generate them.
 
 ### Question answering
 
-`question_sql/runner.py` processes JSONL sequentially, validating questions and caching per-business context from `context.py`. Context checks `_catalog` against actual database tables and columns. `llm.py` makes one structured request selecting both answer type and SQL from the question, `as_of_date`, full imported README, actual schema/types, provenance and warnings. Source records and training answers are not model input. Relative dates use `as_of_date`, not the machine date; there are no model retries or repair calls.
+`question_sql/runner.py` processes JSONL sequentially, validating questions and caching per-business context from `context.py`. Context checks `_catalog` against actual tables/columns and strictly validates required `<business_id>.json` profiles, including grouped table coverage and ordered names/types. `--profile-dir` defaults to `<resolved database parent>/business_profiles`. Missing/invalid/schema-mismatched profiles fail before model access with a regeneration command; no automatic profiling or live status queries. Same-schema stale/cross-database profiles cannot be detected; rerun manually after data changes and keep directories separate per database.
+
+`llm.py` sends one flat payload: question, business_id, as_of_date, date_boundaries, full imported readme, complete business_profile, sources and warnings. No duplicate DDL/schema. Grouped `names` statistics describe UNION ALL, not individual tables or joins. Actual bounded category labels go to the configured endpoint; README/labels can be sensitive and name-based exclusions are not PII detection. Existing profiler allowlist coverage is unchanged, not arbitrary-column semantic discovery. No transaction samples or training answers are added. Relative dates use `as_of_date`, not the machine date; no model retries or repair calls.
 
 `execution.py` spawns a worker, copies only the requested business into an in-memory DuckDB, detaches the read-only original, disables external access/extensions/spilling and locks configuration before executing exactly one SELECT/CTE. Defaults are 60 seconds including copying, 10,000 result rows, 256 MiB DuckDB memory and a 16 MiB payload. Limits fail explicitly rather than truncate. This is defense in depth, not an OS sandbox or a bound on all Python allocations.
 
-`answers.py` validates result shapes and serializes exact decimals as JSON numbers. `unanswerable`/`abstain` skip execution. Answer records omit `alias`; SQL, raw results and stage-specific errors go to a separate `<output stem>.details.jsonl`. Both output files are created exclusively. Failed questions are omitted from answers, recorded in details, and make the batch exit nonzero while other questions continue.
+`answers.py` validates result shapes and serializes exact decimals as JSON numbers. `unanswerable`/`abstain` skip execution. Answer records omit `alias`; SQL, raw results and stage-specific errors go to a separate `<output stem>.details.jsonl`. Both output files are created exclusively. Model `unanswerable`/`abstain` both emit `{id, type: "unanswerable", reason}`. Failed questions with a valid nonempty Unicode ID emit the same shape with a stage-specific reason; missing/invalid IDs remain details-only. Details preserve original errors/status; failures still make the batch exit nonzero while other questions continue.
 
 ### Configuration
 

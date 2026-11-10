@@ -10,8 +10,8 @@ For execution order and commands, see [the flow document](flow.md). Its database
 | --- | --- |
 | `question_sql/__main__.py` | Parse required input/output paths and positive execution limits, then invoke the runner. |
 | `runner.py` | Validate batch paths, manage read-only DB access and exclusive output creation, cache business context, coordinate question stages, and report failures. |
-| `context.py` | Validate question records and build business context after checking catalog metadata against actual database tables. |
-| `llm.py` | Construct reference DDL and prompt context, make one structured request, and validate the returned answer type and SQL. |
+| `context.py` | Validate question records, catalog/schema consistency and required saved profile JSON; provide catalog checks independently to the worker. |
+| `llm.py` | Construct one flat profile/README payload, make one structured request, and validate the returned answer type and SQL. |
 | `execution.py` | Spawn a worker, copy the requested business into memory, restrict DuckDB, enforce query/result limits, and return results to the parent. |
 | `answers.py` | Validate result shapes/types and serialize answer records and diagnostics, preserving exact decimal answers. |
 
@@ -32,14 +32,19 @@ The parent process opens the database read-only. `context.py` requires:
 - A loaded business with a nonempty imported README.
 - Catalog mappings that match the actual schema's base tables.
 - Actual columns and DuckDB types for every mapped table.
+- A saved `<business_id>.json` profile under `--profile-dir` (default `<resolved database parent>/business_profiles`) matching every table and its ordered columns/types.
 
-The resulting context contains the README snapshot, all actual column/type definitions, source file/sheet mappings, and import warnings. The runner caches it per business within a batch.
+Profiles use exactly `{business_id, tables}`. Table entries have `name` or grouped `names`, plus `columns`. Groups share an ordered schema and describe combined `UNION ALL` rows; they do not imply joins or per-member label presence. Supported scalar columns have `distinct_count` excluding NULL, FLOAT/DOUBLE add `nonfinite_count`, and unsupported types have `stats_omitted`. VARCHAR domains are complete bounded `values` or an explicit omission reason. Unknown/legacy extras, invalid names/counts/domains and schema mismatches are rejected before model access with a regeneration command. QA does not query transaction records or regenerate statistics.
+
+The resulting context contains the README snapshot, compact validated profile, source file/sheet mappings without duplicate columns, and import warnings. The runner caches it per business; dates are computed per question. Rerun the standalone profiler after data changes and keep directories separate per database: schema equality cannot detect stale or cross-database statistics because profiles store no freshness/source identity.
 
 This makes `_catalog` an explicit integration contract with the importer, not optional descriptive metadata. Source file names alone are insufficient to infer destination table names.
 
 ## Model boundary
 
-The model receives the question, business ID, reference date, quoted reference DDL, and full business context. Source records are not sent as query samples; the README can itself contain sensitive content.
+The model receives a flat JSON payload with exactly `question`, `business_id`, `as_of_date`, `date_boundaries`, `readme`, `business_profile`, `sources` and `warnings`. The full saved validated profile, including actual bounded category labels, is sent without duplicate DDL/nested schema or live status queries. Python supplies yesterday, previous Monday–Sunday week and as-of exclusive-end boundaries.
+
+No transaction samples or reference answers are added. README, mappings, warnings and labels can contain sensitive content; review them before sending to the configured endpoint. The profiler's name-based exclusions do not guarantee PII detection, and its existing category-name allowlist still limits domain coverage. This integration does not discover arbitrary-column semantics.
 
 The response contains exactly:
 
@@ -77,7 +82,7 @@ Row and payload overflow are errors, not silent truncation. Copying a large busi
 
 ### Answer file
 
-Successful answer records contain `id`, `type`, and `answer`, without `alias`. `unanswerable` and `abstain` contain only `id` and `type`.
+Successful answer records contain `id`, `type`, and `answer`, without `alias`. Model `unanswerable` and `abstain` both serialize as `{id, type: "unanswerable", reason}` with a local explanation; their original type remains in details.
 
 The formatter enforces one row/column for scalars and one column for lists. Tables contain `columns` and `rows`. Date answers use `YYYY-MM-DD`; nested native dates/times become ISO strings. Exact decimals serialize as JSON numbers without conversion through binary float. Percent values represent percentage points.
 
@@ -89,7 +94,7 @@ Both files use exclusive creation and incremental flushing. They are not a singl
 
 ## Error boundaries
 
-The runner tracks `input`, `context`, `model`, `execution`, and `serialization` stages. Question-level failures produce a details record, omit the answer, and allow the next line to run. They are not converted into `unanswerable` or `abstain`.
+The runner tracks `input`, `context`, `model`, `execution`, and `serialization` stages. Question-level failures produce a details error record and an `unanswerable` answer with a stage-specific reason when the input has a valid nonempty Unicode ID. Inputs without a usable ID remain details-only. The next line still runs; error details distinguish operational failures from model nonanswers.
 
 Output-writing failures abort the batch to avoid hiding data-loss errors. Any question failure makes the final exit status nonzero. `--limit` counts input lines rather than successful answers.
 
